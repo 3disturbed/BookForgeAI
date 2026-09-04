@@ -125,8 +125,29 @@ checks every render against the canon. Consistency is probabilistic; the system
 reduces drift, it does not eliminate it.
 
 **The PDF.** Layout produces a structured page model — pages, blocks, images,
-captions — which a server-side renderer turns into a PDF. It is never generated
-from raw Markdown.
+captions — which a headless Chromium renderer turns into a PDF through print
+CSS: justified serif with hyphenation, orphan and widow control, small-caps
+chapter openings, real tables. Structural pages (cover, front matter, plates)
+keep their own leaf; body prose is allowed to flow, so pages fill the way a
+typesetter would set them. Rendering happens inside the Proof job, so it is
+awaited, retried with the job, and QA'd against the document that actually
+exists. PDFKit remains a fallback for environments without a browser
+(`PDF_RENDERER=pdfkit`). It is never generated from raw Markdown.
+
+**Cost control.** Because agents declare a *capability* rather than a model,
+spend is a configuration decision. Mechanical agents — asset designer, scene
+composer, image director, copy editor, publisher — route to `OPENAI_LIGHT_MODEL`;
+reasoning effort is set per tier; image fidelity is set per project; and each
+critic persona reads only the artifacts its lens can act on rather than all five
+receiving the same context. On a live run this moved over half of all calls off
+the frontier model.
+
+**Degrading rather than failing.** Model safety systems refuse innocuous
+subjects — a sloyd carving knife reads as a weapon. A refusal is a permanent
+answer for that prompt, so it is never retried, and agents whose output is
+enrichment rather than the book itself are marked optional: the scheduler steps
+past their failures and the console reports the stage as degraded. A refused
+reference image costs an asset its artwork, not its bible.
 
 ## Repository
 
@@ -178,5 +199,7 @@ Known limits of the MVP:
   are the documented path to scale out.
 - Research citations are model-supplied and unverified; treat `confidence: low`
   sources accordingly.
-- Layout estimates page breaks from the model's page plan rather than measuring
-  rendered text, so long chapters can under-fill pages.
+- Chromium adds roughly 300MB to `npm install`. Set `PDF_RENDERER=pdfkit` to
+  skip it, at the cost of typography.
+- The editorial loop re-reads every chapter each round, so a book that needs all
+  three cycles pays for three full critique passes.

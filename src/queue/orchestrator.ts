@@ -174,10 +174,16 @@ export function advanceProject(projectId: string): void {
 
     project = completeStage(project, stage);
 
-    // The editorial loop can send the project back around instead of forward.
-    if (stage.id === 'diagnose') {
-      const looped = applyRevisionDecision(project);
-      if (looped) return;
+    // SDD.md §7 orders the loop CRITICS -> DIAGNOSIS -> REWRITE -> CRITICS, so
+    // the decision belongs after the rewrite, not after the diagnosis. Deciding
+    // earlier skipped the rewrite entirely.
+    if (stage.id === 'rewrite') {
+      if (applyRevisionDecision(project)) {
+        // Reopening the loop stages queues nothing by itself; re-enter the
+        // scheduler so the next round's critics are enqueued.
+        advanceProject(projectId);
+        return;
+      }
       project = repo.getProject(projectId)!;
     }
   }
@@ -311,13 +317,21 @@ function syncProjectFromBrief(projectId: string): void {
 
 /* -------------------------- revision loop --------------------------- */
 
-/** Returns true when the project looped back for another critique pass. */
+/**
+ * Called once the rewrite for a round is done. Returns true when the project
+ * looped back for another critique pass over the revised text.
+ */
 function applyRevisionDecision(project: repo.ProjectRow): boolean {
-  const openCriticalIssues = repo
-    .latestArtifactsOfKind<{ verdict: string; tasks: { severity: string }[] }>(
-      project.id,
-      'revision_tasks',
-    )
+  const diagnoses = repo.latestArtifactsOfKind<{
+    verdict: string;
+    tasks: { severity: string }[];
+  }>(project.id, 'revision_tasks');
+
+  // Nothing was rewritten this round, so there is nothing new to re-read.
+  const rewroteSomething = diagnoses.some((a) => a.data.verdict === 'revise');
+  if (!rewroteSomething) return false;
+
+  const openCriticalIssues = diagnoses
     .filter((a) => a.data.verdict === 'revise')
     .reduce(
       (total, a) => total + (a.data.tasks ?? []).filter((t) => t.severity === 'critical').length,
@@ -327,7 +341,9 @@ function applyRevisionDecision(project: repo.ProjectRow): boolean {
   const decision = revisionDecision({
     cycle: project.revisionCycle,
     maxCycles: env().MAX_REVISION_CYCLES,
-    openCriticalIssues,
+    // A round that rewrote anything is worth re-reading even if its remaining
+    // issues were all non-critical, so the loop verifies its own work.
+    openCriticalIssues: Math.max(openCriticalIssues, 1),
   });
 
   if (decision === 'pass') return false;

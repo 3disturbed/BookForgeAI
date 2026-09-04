@@ -196,11 +196,23 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
   },
   {
     match: 'You are the Diagnosis agent',
-    body: (user) => ({
-      chapterNumber: chapterNumberFrom(user),
-      tasks: [],
-      verdict: 'pass',
-    }),
+    body: (user) => {
+      // Demands a rewrite for the first `demandRewrites` diagnoses, so a test
+      // can drive the editorial loop round more than once.
+      const demand = state.demandRewrites > 0;
+      if (demand) state.demandRewrites--;
+      return {
+        chapterNumber: chapterNumberFrom(user),
+        tasks: demand
+          ? [{
+              id: 't1', severity: 'critical',
+              instruction: 'Fix the unsupported claim in paragraph two.',
+              rationale: 'Flagged by the factual critic.', sourceCritiques: ['factual'],
+            }]
+          : [],
+        verdict: demand ? 'revise' : 'pass',
+      };
+    },
   },
   {
     match: 'You are the Rewriter',
@@ -283,6 +295,9 @@ function chapterNumberFrom(user: string): number {
 function sceneKeyFrom(user: string): string {
   return /"key":\s*"([^"]+)"/.exec(user)?.[1] ?? 'ch1-the-lamp';
 }
+
+/** Mutable stub state, so a test can steer the pipeline down a branch. */
+export const state = { demandRewrites: 0 };
 
 export interface FakeOpenAI {
   url: string;

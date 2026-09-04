@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { startFakeOpenAI, type FakeOpenAI } from './fake-openai.js';
+import { startFakeOpenAI, state as fakeState, type FakeOpenAI } from './fake-openai.js';
 
 /**
  * Drives the whole pipeline against a stubbed model API: 22 agents, the
@@ -174,6 +174,39 @@ test('a project runs the full pipeline and publishes', async () => {
   // Critics ran as five independent personas per chapter.
   const critiques = repo.latestArtifactsOfKind(project.id, 'critique');
   assert.equal(critiques.length, 10, 'five critic personas across two chapters');
+});
+
+test('the editorial loop rewrites, re-reads, and terminates', async () => {
+  // Two chapters diagnosed as needing a rewrite: the loop must rewrite them,
+  // send the revised text back to the critics, and then settle.
+  fakeState.demandRewrites = 2;
+
+  const user = repo.upsertUser('loop@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Loop', idea: 'A book that needs a second pass.',
+  });
+
+  await drain(project.id);
+  const after = repo.getProject(project.id)!;
+
+  assert.ok(after.revisionCycle >= 1, 'the loop went round at least once');
+  assert.ok(
+    after.revisionCycle <= 3,
+    `the loop terminated within MAX_REVISION_CYCLES, saw ${after.revisionCycle}`,
+  );
+
+  // The rewrite actually ran — deciding before the rewrite used to skip it.
+  const revised = repo.latestArtifactsOfKind(project.id, 'revised_content');
+  assert.ok(revised.length > 0, 'the rewriter produced revised chapters');
+
+  // Critics re-read the revised text, so there are critiques from a later round.
+  const jobs = repo.listJobs(project.id, 500);
+  const laterRounds = jobs.filter((j) => j.agent === 'critics' && j.round > 0);
+  assert.ok(laterRounds.length > 0, 'critics ran again after the rewrite');
+
+  // And the pipeline did not stall: it reached the end.
+  assert.ok(after.completedStages.includes('proof'), 'the pipeline ran to completion');
+  assert.equal(jobs.filter((j) => j.status === 'queued' || j.status === 'running').length, 0);
 });
 
 test('payment confirmation is idempotent', async () => {
