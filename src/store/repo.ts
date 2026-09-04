@@ -353,6 +353,8 @@ export interface JobRow {
   scopeKey: string | null;
   status: JobStatus;
   round: number;
+  /** Set while a retry is waiting out its backoff. */
+  retryAfter: string | null;
   inputArtifactIds: string[];
   outputArtifactIds: string[];
   model: string | null;
@@ -375,6 +377,7 @@ function mapJob(r: Record<string, unknown>): JobRow {
     scopeKey: (r.scope_key as string | null) ?? null,
     status: r.status as JobStatus,
     round: Number(r.round ?? 0),
+    retryAfter: (r.retry_after as string | null) ?? null,
     inputArtifactIds: fromJson<string[]>(r.input_artifact_ids, []),
     outputArtifactIds: fromJson<string[]>(r.output_artifact_ids, []),
     model: (r.model as string | null) ?? null,
@@ -462,15 +465,19 @@ export function getJob(id: string): JobRow | null {
 /** Claims the next queued job for a project, or any project when unscoped. */
 export function claimNextJob(projectId?: string): JobRow | null {
   const db = database();
+  const now = nowIso();
   const row = (
     projectId
       ? db.prepare(
           `SELECT * FROM agent_jobs WHERE status = 'queued' AND project_id = ?
+             AND (retry_after IS NULL OR retry_after <= ?)
            ORDER BY created_at LIMIT 1`,
-        ).get(projectId)
+        ).get(projectId, now)
       : db.prepare(
-          `SELECT * FROM agent_jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1`,
-        ).get()
+          `SELECT * FROM agent_jobs WHERE status = 'queued'
+             AND (retry_after IS NULL OR retry_after <= ?)
+           ORDER BY created_at LIMIT 1`,
+        ).get(now)
   ) as Record<string, unknown> | undefined;
 
   if (!row) return null;
@@ -501,16 +508,51 @@ export function completeJob(id: string, patch: {
   );
 }
 
+/** Exponential backoff, so a network blip does not exhaust the budget at once. */
+function backoffUntil(attempt: number): string {
+  const seconds = Math.min(2 ** attempt * 5, 300);
+  return new Date(Date.now() + seconds * 1000).toISOString();
+}
+
 export function failJob(id: string, error: string, retryable: boolean): void {
   const db = database();
   if (retryable) {
+    const row = db.prepare('SELECT retry_count FROM agent_jobs WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    const attempt = Number(row?.retry_count ?? 0) + 1;
     db.prepare(
-      `UPDATE agent_jobs SET status = 'queued', retry_count = retry_count + 1, error = ? WHERE id = ?`,
-    ).run(error, id);
+      `UPDATE agent_jobs
+       SET status = 'queued', retry_count = ?, error = ?, retry_after = ?, started_at = NULL
+       WHERE id = ?`,
+    ).run(attempt, error, backoffUntil(attempt), id);
     return;
   }
   db.prepare(`UPDATE agent_jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?`)
     .run(error, nowIso(), id);
+}
+
+/**
+ * Puts failed and blocked jobs back in the queue with a fresh budget. Recovery
+ * from an outage is otherwise impossible: a failed stage stalls the pipeline
+ * permanently, and a restart only rescues jobs left mid-flight.
+ */
+export function retryFailedJobs(projectId: string, stage?: StageId): number {
+  const db = database();
+  const result = stage
+    ? db.prepare(
+        `UPDATE agent_jobs
+         SET status = 'queued', retry_count = 0, retry_after = NULL,
+             error = NULL, started_at = NULL, finished_at = NULL
+         WHERE project_id = ? AND stage = ? AND status IN ('failed','blocked')`,
+      ).run(projectId, stage)
+    : db.prepare(
+        `UPDATE agent_jobs
+         SET status = 'queued', retry_count = 0, retry_after = NULL,
+             error = NULL, started_at = NULL, finished_at = NULL
+         WHERE project_id = ? AND status IN ('failed','blocked')`,
+      ).run(projectId);
+  return Number(result.changes);
 }
 
 export function blockJob(id: string, reason: string): void {

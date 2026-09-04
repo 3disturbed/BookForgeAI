@@ -260,8 +260,17 @@ function renderPipeline() {
           `${jobCounts.completed} done · ${jobCounts.running} running · ` +
           `${jobCounts.queued} queued · ${jobCounts.failed} failed`),
         el('div', { style: 'flex:1' }),
+        jobCounts.failed + jobCounts.blocked > 0 &&
+          el('button', { class: 'small primary', onclick: () => retry(null) },
+            `Retry all ${jobCounts.failed + jobCounts.blocked} failed`),
         el('button', { class: 'small', onclick: advance }, 'Advance now')),
     ),
+
+    jobCounts.failed + jobCounts.blocked > 0 &&
+      el('div', { class: 'notice err' },
+        `${jobCounts.failed + jobCounts.blocked} job(s) failed after exhausting their retries. ` +
+        'A dropped connection or a rate limit will do this. Retrying gives them a fresh budget; ' +
+        'nothing already produced is lost or repeated.'),
 
     project.publicationState !== 'DRAFT' &&
       el('div', { class: 'notice ok' }, `Publication state: ${project.publicationState}`),
@@ -284,6 +293,8 @@ function renderStage(stage) {
           `${stage.degraded} skipped`),
       stage.state === 'failed' && stage.errors.length > 0 &&
         el('span', { class: 'tag err', title: stage.errors.join('\n') }, 'error'),
+      stage.retryInSeconds !== null && stage.retryInSeconds !== undefined &&
+        el('span', { class: 'tag' }, `retrying in ${stage.retryInSeconds}s`),
     ),
     el('div', { class: 'row' },
       stage.gate && approvals[stage.gate] === true && el('span', { class: 'tag ok' }, 'approved'),
@@ -294,8 +305,27 @@ function renderStage(stage) {
         class: 'small primary',
         onclick: () => approve(stage.gate, true),
       }, 'Approve'),
+      stage.retryable > 0 && el('button', {
+        class: `small${stage.state === 'failed' ? ' primary' : ''}`,
+        title: stage.errors.join('\n'),
+        onclick: () => retry(stage.id),
+      }, `Retry ${stage.retryable}`),
     ),
   );
+}
+
+/** Requeues a stage's failed jobs with a fresh budget. */
+async function retry(stage) {
+  try {
+    const result = await api(`/projects/${state.current.project.id}/retry`, {
+      method: 'POST', body: stage ? { stage } : {},
+    });
+    state.current = result;
+    state.cache = {};
+    render();
+  } catch (error) {
+    alert(error.message);
+  }
 }
 
 async function advance() {

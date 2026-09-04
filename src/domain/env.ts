@@ -57,6 +57,8 @@ const EnvSchema = z.object({
 
   /** Concurrent agent jobs per worker loop. */
   AGENT_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(3),
+  /** Automatic attempts before a job is left for a human to retry. */
+  AGENT_MAX_RETRIES: z.coerce.number().int().min(0).max(10).default(4),
   /** Signed download URLs are short lived (SECURITY.md). */
   SIGNED_URL_TTL_SECONDS: z.coerce.number().int().positive().default(300),
 

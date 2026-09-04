@@ -583,7 +583,7 @@ function negativeClause(negatives: (string | undefined)[]): string {
 
 /* ----------------------------- driver ------------------------------ */
 
-const MAX_RETRIES = 2;
+
 
 /**
  * Runs one job end to end: READ -> REASON -> VALIDATE -> WRITE ARTIFACT ->
@@ -627,7 +627,7 @@ export async function runJob(job: repo.JobRow): Promise<void> {
     repo.recordUsage({ projectId: project.id, jobId: job.id, usage });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const retryable = isRetryable(error) && job.retryCount < MAX_RETRIES;
+    const retryable = isRetryable(error) && job.retryCount < env().AGENT_MAX_RETRIES;
     repo.failJob(job.id, message, retryable);
   }
 }

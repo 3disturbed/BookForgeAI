@@ -344,3 +344,66 @@ test('an answer to a question the brief never asked is rejected', async () => {
     /No such open question/,
   );
 });
+
+test('a stage failed by a dropped connection can be retried back into motion', async () => {
+  const user = repo.upsertUser('retry@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Retry', idea: 'A book interrupted by a network fault.',
+  });
+
+  orchestrator.advanceProject(project.id);
+  await runner.runJob(repo.claimNextJob(project.id)!);
+  orchestrator.applyApproval({
+    projectId: project.id, gate: 'brief', approved: true, actor: 'test',
+  });
+  orchestrator.advanceProject(project.id);
+
+  // Exhaust the budget the way a sustained outage would.
+  const job = repo.claimNextJob(project.id)!;
+  for (let i = 0; i <= Number(process.env.AGENT_MAX_RETRIES ?? 4); i++) {
+    repo.failJob(job.id, 'fetch failed: ECONNRESET', i < Number(process.env.AGENT_MAX_RETRIES ?? 4));
+  }
+  repo.failJob(job.id, 'fetch failed: ECONNRESET', false);
+  assert.equal(repo.getJob(job.id)!.status, 'failed');
+
+  // The scheduler will not step past a required agent, so the run is stuck.
+  orchestrator.advanceProject(project.id);
+  assert.equal(repo.claimNextJob(project.id), null, 'nothing is claimable while it is failed');
+
+  // Retrying restores it with a fresh budget and no backoff wait.
+  const requeued = repo.retryFailedJobs(project.id);
+  assert.equal(requeued, 1);
+
+  const restored = repo.getJob(job.id)!;
+  assert.equal(restored.status, 'queued');
+  assert.equal(restored.retryCount, 0, 'the budget is reset');
+  assert.equal(restored.retryAfter, null, 'and it is claimable immediately');
+
+  orchestrator.advanceProject(project.id);
+  const again = repo.claimNextJob(project.id);
+  assert.ok(again, 'the pipeline moves again');
+  await runner.runJob(again);
+  assert.equal(repo.getJob(again.id)!.status, 'completed');
+});
+
+test('an automatic retry waits out a backoff before it can be claimed', async () => {
+  const user = repo.upsertUser('backoff@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Backoff', idea: 'A book that hits a rate limit.',
+  });
+  orchestrator.advanceProject(project.id);
+
+  const job = repo.claimNextJob(project.id)!;
+  repo.failJob(job.id, 'rate limited', true);
+
+  const requeued = repo.getJob(job.id)!;
+  assert.equal(requeued.status, 'queued');
+  assert.ok(requeued.retryAfter, 'a backoff was set');
+  assert.ok(
+    new Date(requeued.retryAfter!).getTime() > Date.now(),
+    'the backoff is in the future',
+  );
+
+  // Without the wait, three attempts would burn in about a second.
+  assert.equal(repo.claimNextJob(project.id), null, 'it is not claimable yet');
+});

@@ -150,6 +150,15 @@ critic persona reads only the artifacts its lens can act on rather than all five
 receiving the same context. On a live run this moved over half of all calls off
 the frontier model.
 
+**Recovering from failure.** Network faults and rate limits are the common case,
+so a failed job is requeued behind an exponential backoff rather than
+immediately, which stops a brief outage from burning the whole retry budget in
+a second. Once the budget is spent the job is left failed, and because the
+scheduler will not step past a required agent, the run stops. Retrying from the
+console or `POST /projects/:id/retry` returns those jobs to the queue with a
+fresh budget, for one stage or the whole project. Work already completed is kept
+and never repeated. Jobs left mid-flight by a restart are requeued on startup.
+
 **Degrading rather than failing.** Model safety systems refuse innocuous
 subjects — a sloyd carving knife reads as a weapon. A refusal is a permanent
 answer for that prompt, so it is never retried, and agents whose output is
@@ -207,6 +216,8 @@ Known limits of the MVP:
   are the documented path to scale out.
 - Research citations are model-supplied and unverified; treat `confidence: low`
   sources accordingly.
+- A refused image is not always refused on retry, so a degraded stage is worth
+  retrying once before accepting the gap.
 - Chromium adds roughly 300MB to `npm install`. Set `PDF_RENDERER=pdfkit` to
   skip it, at the cost of typography.
 - The editorial loop re-reads every chapter each round, so a book that needs all

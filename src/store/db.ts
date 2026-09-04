@@ -92,6 +92,9 @@ function migrate(conn: DatabaseSync): void {
       scope_key           TEXT,
       status              TEXT NOT NULL DEFAULT 'queued',
       round               INTEGER NOT NULL DEFAULT 0,
+      -- Earliest time a requeued job may be claimed, so a transient outage
+      -- does not burn the whole retry budget in a second.
+      retry_after         TEXT,
       input_artifact_ids  TEXT NOT NULL DEFAULT '[]',
       output_artifact_ids TEXT NOT NULL DEFAULT '[]',
       model               TEXT,
@@ -173,6 +176,27 @@ function migrate(conn: DatabaseSync): void {
     );
     CREATE INDEX IF NOT EXISTS idx_usage_project ON usage_ledger(project_id);
   `);
+
+  applyColumnMigrations(conn);
+}
+
+/**
+ * Additive column migrations. `CREATE TABLE IF NOT EXISTS` silently does
+ * nothing on an existing database, so a column added to the schema above never
+ * reaches a database created before it. Every such column is listed here.
+ */
+const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
+  { table: 'agent_jobs', column: 'round', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'agent_jobs', column: 'retry_after', definition: 'TEXT' },
+];
+
+function applyColumnMigrations(conn: DatabaseSync): void {
+  for (const { table, column, definition } of ADDED_COLUMNS) {
+    const existing = conn.prepare(`PRAGMA table_info(${table})`).all() as Record<string, unknown>[];
+    if (existing.length === 0) continue; // table not created yet
+    if (existing.some((c) => c.name === column)) continue;
+    conn.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 export const nowIso = (): string => new Date().toISOString();

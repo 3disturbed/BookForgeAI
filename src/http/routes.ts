@@ -6,7 +6,7 @@ import { computeMargin, DEFAULT_RATES } from '../domain/costs.js';
 import { env, isOpenAiConfigured, isStripeConfigured } from '../domain/env.js';
 import { BadRequestError, BookForgeError, NotFoundError, PreconditionError } from '../domain/errors.js';
 import { slug } from '../domain/ids.js';
-import { ORDERED_STAGES, STAGES } from '../domain/pipeline.js';
+import { ORDERED_STAGES, STAGE_IDS, STAGES } from '../domain/pipeline.js';
 import { APPROVAL_GATES, type ApprovalGate } from '../domain/states.js';
 import { storageKey } from '../domain/storage-paths.js';
 import { confirmPayment, createCheckoutSession, verifyWebhook } from '../billing/checkout.js';
@@ -116,6 +116,26 @@ api.post('/projects/:id/advance', (req: Request, res: Response) => {
   ownedProject(req, param(req, 'id'));
   advanceProject(param(req, 'id'));
   res.json(snapshot(req, param(req, 'id')));
+});
+
+/**
+ * Puts a stalled project back in motion. A failed job on a required agent stops
+ * the pipeline for good otherwise: the scheduler will not step past it, and a
+ * restart only rescues jobs interrupted mid-flight.
+ */
+api.post('/projects/:id/retry', (req: Request, res: Response) => {
+  const project = ownedProject(req, param(req, 'id'));
+
+  const body = z.object({ stage: z.enum(STAGE_IDS).optional() }).safeParse(req.body ?? {});
+  if (!body.success) throw new BadRequestError('Unknown stage');
+
+  const requeued = repo.retryFailedJobs(project.id, body.data.stage);
+  if (requeued > 0) {
+    repo.updateProject(project.id, { status: 'forging' });
+    advanceProject(project.id);
+  }
+
+  res.json({ requeued, ...snapshot(req, project.id) });
 });
 
 /* ---------------------------- approvals ---------------------------- */
@@ -423,6 +443,15 @@ function acceptanceFor(projectId: string) {
   });
 }
 
+/** How long until the soonest backed-off job becomes claimable. */
+function nextRetryInSeconds(jobs: repo.JobRow[]): number | null {
+  const waits = jobs
+    .filter((j) => j.status === 'queued' && j.retryAfter)
+    .map((j) => Math.ceil((new Date(j.retryAfter!).getTime() - Date.now()) / 1000))
+    .filter((n) => n > 0);
+  return waits.length ? Math.min(...waits) : null;
+}
+
 function snapshot(req: Request, projectId: string) {
   const project = ownedProject(req, projectId);
   const completed = new Set(project.completedStages);
@@ -458,6 +487,9 @@ function snapshot(req: Request, projectId: string) {
       jobs: stageJobs.length,
       done: stageJobs.filter((j) => j.status === 'completed').length,
       degraded: degraded.length,
+      retryable: broken.length + degraded.length,
+      /** Seconds until the next automatic attempt, when one is pending. */
+      retryInSeconds: nextRetryInSeconds(stageJobs),
       errors: [...broken, ...degraded].map((j) => j.error).slice(0, 3),
     };
   });

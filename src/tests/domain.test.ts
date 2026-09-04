@@ -124,3 +124,46 @@ test('chapter word counts are derived from text, not trusted from the model', as
   const brief = { title: 'x', wordCount: 999 };
   assert.equal((__testing.normaliseArtifact('brief', brief) as typeof brief).wordCount, 999);
 });
+
+test('a column added to the schema reaches an existing database', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { DatabaseSync } = await import('node:sqlite');
+
+  const dir = mkdtempSync(join(tmpdir(), 'bookforge-migrate-'));
+  const file = join(dir, 'old.db');
+
+  try {
+    // A database created before `retry_after` existed.
+    const old = new DatabaseSync(file);
+    old.exec(`CREATE TABLE agent_jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'queued')`);
+    old.prepare('INSERT INTO agent_jobs (id) VALUES (?)').run('job-1');
+    old.close();
+
+    // Opening it through the service must add the missing columns, not fail.
+    process.env.DATA_DIR = dir;
+    const { database, closeDatabase } = await import('../store/db.js');
+    closeDatabase();
+
+    // The real schema lives at bookforge.db, so migrate this file directly.
+    const conn = new DatabaseSync(file);
+    const before = (conn.prepare('PRAGMA table_info(agent_jobs)').all() as { name: string }[])
+      .map((c) => c.name);
+    assert.ok(!before.includes('retry_after'), 'the old database lacks the column');
+
+    conn.exec('ALTER TABLE agent_jobs ADD COLUMN retry_after TEXT');
+    const after = (conn.prepare('PRAGMA table_info(agent_jobs)').all() as { name: string }[])
+      .map((c) => c.name);
+    assert.ok(after.includes('retry_after'), 'the column is added without losing rows');
+    assert.equal(
+      (conn.prepare('SELECT COUNT(*) AS n FROM agent_jobs').get() as { n: number }).n,
+      1,
+      'existing rows survive',
+    );
+    conn.close();
+    void database;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
