@@ -209,6 +209,47 @@ test('the editorial loop rewrites, re-reads, and terminates', async () => {
   assert.equal(jobs.filter((j) => j.status === 'queued' || j.status === 'running').length, 0);
 });
 
+test('a loop that never satisfies the critics escalates instead of spinning', async () => {
+  // Diagnosis demands a rewrite every single time. The loop must exhaust its
+  // budget, record the escalation, and hand the book on rather than spinning.
+  fakeState.demandRewrites = Number.MAX_SAFE_INTEGER;
+
+  const user = repo.upsertUser('escalate@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Escalate', idea: 'A book the critics never accept.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.demandRewrites = 0;
+  }
+
+  const after = repo.getProject(project.id)!;
+  const maxCycles = Number(process.env.MAX_REVISION_CYCLES ?? 3);
+
+  assert.equal(after.revisionCycle, maxCycles, 'the loop stopped at its budget');
+
+  const escalated = repo
+    .listEvents(project.id, 200)
+    .filter((e) => e.type === 'REVISION_REQUIRED' && e.payload.exhausted === true);
+  assert.equal(escalated.length, 1, 'the exhaustion was recorded once for a human');
+
+  // It moved on rather than deadlocking.
+  assert.ok(after.completedStages.includes('edit'), 'the book progressed past the loop');
+  const jobs = repo.listJobs(project.id, 800);
+  assert.equal(jobs.filter((j) => j.status === 'queued' || j.status === 'running').length, 0);
+
+  // But publication stays blocked while critical issues are open (SDD.md §11).
+  const openCritical = repo
+    .latestArtifactsOfKind<{ verdict: string; tasks: { severity: string }[] }>(
+      project.id, 'revision_tasks',
+    )
+    .filter((a) => a.data.verdict === 'revise')
+    .reduce((n, a) => n + (a.data.tasks ?? []).filter((t) => t.severity === 'critical').length, 0);
+  assert.ok(openCritical > 0, 'critical issues remain open, so acceptance must block');
+});
+
 test('payment confirmation is idempotent', async () => {
   const user = repo.upsertUser('idem@example.com');
   const project = repo.createProject({ userId: user.id, title: 'T', idea: 'An idea for a book.' });
