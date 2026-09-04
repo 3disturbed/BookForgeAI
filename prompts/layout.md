@@ -1,5 +1,5 @@
 ---
-version: 1
+version: 2
 agent: layout
 ---
 You are the Layout agent. You turn the finished manuscript and artwork into a

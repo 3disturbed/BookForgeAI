@@ -11,7 +11,7 @@ import { APPROVAL_GATES, type ApprovalGate } from '../domain/states.js';
 import { storageKey } from '../domain/storage-paths.js';
 import { confirmPayment, createCheckoutSession, verifyWebhook } from '../billing/checkout.js';
 import { advanceProject, applyApproval, workerStatus } from '../queue/orchestrator.js';
-import { blobExists, signedUrlFor } from '../storage/blobs.js';
+import { blobExists, blobExistsSync, signedUrlFor } from '../storage/blobs.js';
 import * as repo from '../store/repo.js';
 import { issueSession, clearSession, currentUserId, ownedProject, requireUser, userIdOf } from './auth.js';
 
@@ -293,8 +293,12 @@ function acceptanceFor(projectId: string) {
   const chapters = repo.latestArtifactsOfKind(projectId, 'clean_manuscript');
   const continuity = repo.latestArtifact<{ passed: boolean }>(projectId, 'continuity_report');
   const proof = repo.latestArtifact<{ passed: boolean }>(projectId, 'pdf_proof_report');
-  const pageModel = repo.latestArtifact(projectId, 'page_model');
   const approvals = repo.listApprovals(projectId);
+
+  // A page model is a plan, not a document. Check that a PDF actually exists.
+  const pdfRendered =
+    blobExistsSync(storageKey(projectId, 'exports', 'edition.pdf')) ||
+    blobExistsSync(storageKey(projectId, 'renders', 'edition-draft.pdf'));
 
   const openCritical = repo
     .latestArtifactsOfKind<{ verdict: string; tasks: { severity: string }[] }>(
@@ -316,7 +320,7 @@ function acceptanceFor(projectId: string) {
       ? qaResults.length > 0 && qaResults.every((q) => q.data.passed)
       : true,
     continuityPassed: continuity?.data.passed ?? false,
-    pdfRendered: Boolean(pageModel),
+    pdfRendered,
     proofPassed: proof?.data.passed ?? false,
     userApprovedFinalEdition: approvals.final_pdf === true,
     paymentConfirmed: repo.isPaymentConfirmed(projectId),

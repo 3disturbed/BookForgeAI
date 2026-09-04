@@ -100,6 +100,15 @@ export function verifySignedUrl(key: string, exp: string, sig: string): boolean 
   return timingSafeEqual(expected, provided);
 }
 
+/** Synchronous existence check, for callers that cannot await (acceptance). */
+export function blobExistsSync(key: string): boolean {
+  try {
+    return existsSync(resolveKey(key));
+  } catch {
+    return false;
+  }
+}
+
 export function localPathFor(key: string): string {
   return join(blobRoot(), key);
 }
