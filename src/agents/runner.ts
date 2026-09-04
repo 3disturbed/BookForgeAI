@@ -524,6 +524,30 @@ export async function executeAgent(
   }
 }
 
+/** Chapter-shaped artifacts, whose word count is derived rather than trusted. */
+const CHAPTER_KINDS: ReadonlySet<string> = new Set([
+  'chapter', 'revised_content', 'edited_manuscript', 'clean_manuscript',
+]);
+
+/**
+ * Models report `wordCount` inconsistently — sometimes omitted, sometimes a
+ * summary of what they intended to write rather than what they wrote. The
+ * count is displayed to users and used to judge length against the brief, so
+ * it is recomputed from the committed text.
+ */
+function normaliseArtifact(kind: string, data: unknown): unknown {
+  if (!CHAPTER_KINDS.has(kind) || typeof data !== 'object' || data === null) return data;
+
+  const chapter = data as { blocks?: { text?: string }[]; wordCount?: number };
+  if (!Array.isArray(chapter.blocks)) return data;
+
+  const wordCount = chapter.blocks.reduce(
+    (total, block) => total + (String(block?.text ?? '').match(/\S+/g)?.length ?? 0),
+    0,
+  );
+  return { ...chapter, wordCount };
+}
+
 function negativeClause(negatives: (string | undefined)[]): string {
   const items = negatives.filter((n): n is string => Boolean(n && n.trim()));
   return items.length ? `Avoid: ${items.join('; ')}.` : '';
@@ -555,7 +579,7 @@ export async function runJob(job: repo.JobRow): Promise<void> {
       projectId: project.id,
       kind: def.writes,
       scopeKey: outcome.artifactScopeKey !== undefined ? outcome.artifactScopeKey : job.scopeKey,
-      data: outcome.data,
+      data: normaliseArtifact(def.writes, outcome.data),
       producedByJobId: job.id,
     });
 
@@ -594,3 +618,6 @@ function isRetryable(error: unknown): boolean {
   }
   return true;
 }
+
+/** Exposed for unit tests only. */
+export const __testing = { normaliseArtifact };

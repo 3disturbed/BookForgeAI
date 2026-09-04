@@ -102,3 +102,25 @@ test('artifact schemas reject malformed agent output', () => {
     false,
   );
 });
+
+test('chapter word counts are derived from text, not trusted from the model', async () => {
+  const { __testing } = await import('../agents/runner.js');
+  const chapter = {
+    number: 1,
+    title: 'T',
+    // What a model actually returned: a count unrelated to the text it wrote.
+    wordCount: 0,
+    blocks: [
+      { type: 'paragraph', text: 'one two three four five' },
+      { type: 'dialogue', text: '"six seven," she said.' },
+      { type: 'break', text: '' },
+    ],
+  };
+
+  const fixed = __testing.normaliseArtifact('clean_manuscript', chapter) as { wordCount: number };
+  assert.equal(fixed.wordCount, 9, 'counted from the blocks');
+
+  // Artifacts that are not chapters pass through untouched.
+  const brief = { title: 'x', wordCount: 999 };
+  assert.equal((__testing.normaliseArtifact('brief', brief) as typeof brief).wordCount, 999);
+});
