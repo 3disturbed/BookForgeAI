@@ -1,0 +1,42 @@
+#!/bin/sh
+# Refuses commits that would publish a secret.
+#
+# Two checks, both against STAGED content rather than the working tree:
+#   1. a real env file staged by name (config/example.env is a template and is
+#      allowed through, but its values are checked below like everything else)
+#   2. secret-shaped values anywhere in the staged diff
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+
+fail() {
+  echo "pre-commit: refusing to commit — $1" >&2
+  echo "" >&2
+  echo "  Secrets belong in .env, which is gitignored." >&2
+  echo "  If this is genuinely a false positive: git commit --no-verify" >&2
+  exit 1
+}
+
+# 1. Real env files must never be staged.
+staged_env=$(git diff --cached --name-only --diff-filter=ACM \
+  | grep -E '(^|/)\.env($|\.)' || true)
+[ -n "$staged_env" ] && fail "staged env file(s):
+$(echo "$staged_env" | sed 's/^/    /')"
+
+# 2. No secret-shaped value in any staged line.
+#    Matches added lines only, so pre-existing text cannot block a commit.
+hits=$(git diff --cached --unified=0 --diff-filter=ACM \
+  | grep -nE '^\+' \
+  | grep -EI 'sk-[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9]+|sk_test_[A-Za-z0-9]{20,}|rk_live_[A-Za-z0-9]+|whsec_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----' \
+  || true)
+
+if [ -n "$hits" ]; then
+  # Show which files, never the matched values.
+  files=$(git diff --cached --name-only --diff-filter=ACM \
+    | while read -r f; do
+        git diff --cached --unified=0 -- "$f" | grep -qEI 'sk-[A-Za-z0-9_-]{20,}|sk_live_|sk_test_[A-Za-z0-9]{20,}|rk_live_|whsec_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----' && echo "    $f"
+      done)
+  fail "secret-shaped value in staged changes:
+$files"
+fi
+
+exit 0

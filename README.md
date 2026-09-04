@@ -20,10 +20,22 @@ npm start
 
 Open <http://localhost:3000>, sign in with an email, and start a book.
 
+Enable the secret guard once per clone — it refuses any commit that would stage
+an env file or a key-shaped value:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 The MVP runs with **no external infrastructure**: SQLite on disk, blobs on the
 local filesystem, and an in-process job queue. Postgres, Redis and S3 are opt-in
 by setting their variables — the seams for the targets in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+Your API key goes in `.env`, never in `config/example.env` — that template is
+tracked by git and every value in it must stay empty. There is no key-entry field
+in the UI by design: `SECURITY.md` keeps OpenAI and payment keys server-side, and
+`/api/config` reports only whether a key is present, never its value.
 
 Only `OPENAI_API_KEY` is required. Without Stripe keys the service uses a
 development checkout stand-in, which is refused when `NODE_ENV=production`.
