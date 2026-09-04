@@ -573,22 +573,93 @@ function renderCanon(assets) {
     el('p', { class: 'muted' },
       'Recurring entities are designed before illustration to reduce visual drift. ' +
       'Approving the canon gate locks these assets.'),
-    assets.map((a) =>
-      el('div', { class: 'asset' },
-        a.referenceImages[0]
-          ? el('img', { src: a.referenceImages[0], alt: `${a.name} reference`, loading: 'lazy' })
-          : el('div', { class: 'ph' }, 'no reference'),
-        el('div', { style: 'min-width:0' },
-          el('div', { class: 'row' },
-            el('b', {}, a.name),
-            el('span', { class: 'tag' }, a.type),
-            el('span', { class: `tag ${a.status === 'locked' ? 'ok' : ''}` }, a.status),
-            el('span', { class: 'tag' }, a.importance)),
-          el('div', { class: 'muted', style: 'font-size:12.5px;margin-top:6px' },
-            describe(a.referencePackage?.bible ?? a.canonicalDescription)),
-        )),
-    ),
+    assets.map(renderAsset),
   );
+}
+
+function renderAsset(a) {
+  const draft = { prompt: a.referencePrompt, negative: a.negativePrompt };
+
+  return el('div', { class: 'asset' },
+    a.referenceImages[0]
+      ? el('img', { src: a.referenceImages[0], alt: `${a.name} reference`, loading: 'lazy' })
+      : el('div', { class: 'ph' }, 'no reference'),
+
+    el('div', { style: 'min-width:0;flex:1' },
+      el('div', { class: 'row' },
+        el('b', {}, a.name),
+        el('span', { class: 'tag' }, a.type),
+        el('span', { class: `tag ${a.status === 'locked' ? 'ok' : ''}` }, a.status),
+        el('span', { class: 'tag' }, a.importance),
+        a.version > 1 && el('span', { class: 'tag' }, `v${a.version}`),
+        el('div', { style: 'flex:1' }),
+        el('button', {
+          class: 'small ghost',
+          onclick: (e) => {
+            const panel = e.target.closest('.asset').querySelector('.regen');
+            panel.hidden = !panel.hidden;
+          },
+        }, 'Prompt')),
+
+      el('div', { class: 'muted', style: 'font-size:12.5px;margin-top:6px' },
+        describe(a.referencePackage?.bible ?? a.canonicalDescription)),
+
+      // The reference sheet anchors every later illustration of this asset,
+      // so the prompt that produced it is editable.
+      el('div', { class: 'regen', hidden: true, style: 'margin-top:10px' },
+        el('label', {},
+          el('span', {}, 'Reference prompt'),
+          el('textarea', {
+            rows: 3,
+            placeholder: 'Describe the reference sheet to render…',
+            oninput: (e) => { draft.prompt = e.target.value; },
+          }, a.referencePrompt)),
+        el('label', {},
+          el('span', {}, 'Avoid'),
+          el('input', {
+            value: a.negativePrompt,
+            placeholder: 'What this asset should never show',
+            oninput: (e) => { draft.negative = e.target.value; },
+          })),
+        el('div', { class: 'row' },
+          el('button', {
+            class: 'small primary',
+            onclick: (e) => regenerateAsset(a, draft, e.target),
+          }, 'Regenerate reference'),
+          el('span', { class: 'muted', style: 'font-size:11px' },
+            'Costs one image generation and reopens the canon gate.')),
+
+        a.referenceImages.length > 1 &&
+          el('div', { style: 'margin-top:10px' },
+            el('h3', {}, `Earlier versions (${a.referenceImages.length - 1})`),
+            el('div', { class: 'row' },
+              a.referenceImages.slice(1).map((url) =>
+                el('img', {
+                  src: url, loading: 'lazy', alt: 'earlier reference',
+                  style: 'width:64px;height:64px;object-fit:cover;border-radius:6px;border:1px solid var(--line)',
+                })))),
+      ),
+    ));
+}
+
+async function regenerateAsset(asset, draft, button) {
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Rendering…';
+  try {
+    await api(`/projects/${state.current.project.id}/assets/${asset.id}/regenerate`, {
+      method: 'POST',
+      body: { prompt: draft.prompt, negativePrompt: draft.negative },
+    });
+    // The canon gate reopens, so refresh the pipeline as well as the list.
+    state.current = await api(`/projects/${state.current.project.id}`);
+    delete state.cache.assets;
+    render();
+  } catch (error) {
+    alert(error.message);
+    button.disabled = false;
+    button.textContent = original;
+  }
 }
 
 function describe(source) {

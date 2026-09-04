@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { startFakeOpenAI, state as fakeState, type FakeOpenAI } from './fake-openai.js';
-import { countOccurrences } from '../domain/terms.js';
+import { countOccurrences, deriveCorrections } from '../domain/terms.js';
 
 /**
  * Drives the whole pipeline against a stubbed model API: 22 agents, the
@@ -448,4 +448,67 @@ test('a spelling decision is repaired across artifacts and locked assets', async
     countOccurrences(renamed.canonicalDescription, 'Manado'), 0,
     'the canonical description is corrected too',
   );
+});
+
+test('renaming an asset carries its per-asset artifacts with it', async () => {
+  const user = repo.upsertUser('rename-scope@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Scope', idea: 'A ship whose name changes.',
+  });
+
+  const asset = repo.upsertVisualAsset({
+    projectId: project.id, name: 'Manado (Longship)', type: 'vehicle',
+    importance: 'primary', canonicalDescription: {},
+  });
+  // Reference packages are keyed by the slug of the asset's name.
+  repo.writeArtifact({
+    projectId: project.id, kind: 'reference_package', producedByJobId: null,
+    scopeKey: 'manado-longship',
+    data: { assetName: 'Manado (Longship)', bible: {}, referencePrompts: ['A longship.'], negativePrompts: [] },
+  });
+
+  repo.applyTermCorrections(project.id, [{ wrong: 'Manado', right: 'Mapado' }]);
+
+  const renamed = repo.listVisualAssets(project.id).find((a) => a.id === asset.id)!;
+  assert.equal(renamed.name, 'Mapado (Longship)');
+
+  // Without moving the scope key the package would be orphaned, and the asset
+  // would silently lose its reference art in every later illustration.
+  const found = repo.latestArtifact(project.id, 'reference_package', 'mapado-longship');
+  assert.ok(found, 'the reference package follows the new name');
+  assert.equal(
+    repo.latestArtifact(project.id, 'reference_package', 'manado-longship'),
+    null,
+    'nothing is left under the old key',
+  );
+});
+
+test('repairing a spelling does not erase the decision that defined it', async () => {
+  const user = repo.upsertUser('evidence@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Evidence', idea: 'A ship with a contested name.',
+  });
+
+  const question = 'Confirm the ship’s name spelling: Mapado or Manado.';
+  repo.writeArtifact({
+    projectId: project.id, kind: 'decisions', producedByJobId: null,
+    data: { answers: [{ question, answer: 'Mapado', delegated: false, answeredAt: 'now' }] },
+  });
+  repo.writeArtifact({
+    projectId: project.id, kind: 'brief', producedByJobId: null,
+    data: { title: 'The Manado', openQuestions: [question] },
+  });
+
+  repo.applyTermCorrections(project.id, [{ wrong: 'Manado', right: 'Mapado' }]);
+
+  // Book content is corrected...
+  const brief = repo.latestArtifact<{ title: string; openQuestions: string[] }>(project.id, 'brief')!;
+  assert.equal(brief.data.title, 'The Mapado');
+
+  // ...but the question and answer still name the rejected spelling, so the
+  // correction remains derivable and the repair stays repeatable.
+  assert.equal(brief.data.openQuestions[0], question, 'the question is preserved');
+  const kept = repo.latestArtifact<{ answers: { question: string }[] }>(project.id, 'decisions')!;
+  assert.equal(kept.data.answers[0]!.question, question, 'the decision record is untouched');
+  assert.ok(deriveCorrections(kept.data.answers[0]!.question, 'Mapado').length > 0);
 });

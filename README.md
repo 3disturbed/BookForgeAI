@@ -123,6 +123,13 @@ naming answer now yields a correction that is applied to each artifact on the
 way into storage, and can be replayed over work already written, including
 locked visual assets that are otherwise uncorrectable.
 
+**Directing the canon.** Each asset's reference prompt is editable from the
+console and can be re-rendered on demand. Because the reference sheet is what
+every later illustration of that asset is matched against, editing it is how the
+book's look is directed rather than accepted. A new sheet becomes the asset's
+primary reference, earlier ones are kept for comparison, the asset gains a
+version, and the canon gate reopens for approval.
+
 **Human approval gates.** Eight gates — brief, architecture, visual canon,
 outline, manuscript, key illustrations, final PDF, publication payment — hold the
 pipeline until a person approves. Approving the visual canon locks its assets; a

@@ -1,5 +1,5 @@
 import { database, fromJson, nowIso, toJson } from './db.js';
-import { newId } from '../domain/ids.js';
+import { newId, slug } from '../domain/ids.js';
 import type { ArtifactKind } from '../domain/artifacts.js';
 import type { CoreEvent } from '../domain/events.js';
 import type { StageId } from '../domain/pipeline.js';
@@ -329,6 +329,32 @@ export function setAssetStatus(id: string, status: AssetStatus): void {
   database()
     .prepare('UPDATE visual_assets SET status = ?, updated_at = ? WHERE id = ?')
     .run(status, nowIso(), id);
+}
+
+/**
+ * Makes a newly rendered sheet the asset's primary reference, keeping earlier
+ * ones for history. Only the first is passed to the image model, so prepending
+ * is what actually changes future illustrations.
+ */
+export function promoteAssetReferenceImage(id: string, storageKey: string): void {
+  const db = database();
+  const row = db.prepare('SELECT reference_image_keys FROM visual_assets WHERE id = ?').get(id) as
+    | Record<string, unknown>
+    | undefined;
+  if (!row) return;
+
+  const keys = fromJson<string[]>(row.reference_image_keys, []).filter((k) => k !== storageKey);
+  db.prepare(
+    `UPDATE visual_assets SET reference_image_keys = ?, version = version + 1, updated_at = ?
+     WHERE id = ?`,
+  ).run(toJson([storageKey, ...keys]), nowIso(), id);
+}
+
+export function getVisualAsset(id: string): VisualAssetRow | null {
+  const r = database().prepare('SELECT * FROM visual_assets WHERE id = ?').get(id) as
+    | Record<string, unknown>
+    | undefined;
+  return r ? mapAsset(r) : null;
 }
 
 export function addAssetReferenceImage(id: string, storageKey: string): void {
@@ -867,16 +893,48 @@ export function applyTermCorrections(
   if (corrections.length === 0) return { artifacts: 0, assets: 0 };
   const db = database();
 
+  // Per-asset artifacts are keyed by the slug of the asset's name, so a rename
+  // orphans them: the reference package stops reaching the Image Director and
+  // the asset quietly loses its reference art. Scope keys move with the name.
+  const slugCorrections = corrections.map((c) => ({ wrong: slug(c.wrong), right: slug(c.right) }));
+
   let artifacts = 0;
-  const rows = db.prepare('SELECT id, data FROM artifacts WHERE project_id = ?').all(projectId) as
-    Record<string, unknown>[];
-  const updateArtifact = db.prepare('UPDATE artifacts SET data = ? WHERE id = ?');
+  const rows = db
+    .prepare('SELECT id, kind, data, scope_key FROM artifacts WHERE project_id = ?')
+    .all(projectId) as Record<string, unknown>[];
+  const updateArtifact = db.prepare('UPDATE artifacts SET data = ?, scope_key = ? WHERE id = ?');
+
   for (const row of rows) {
+    // The decision record states which spelling was rejected. Rewriting it
+    // erases the evidence and makes the correction underivable next time.
+    if (row.kind === 'decisions') continue;
+
     const before = row.data as string;
-    const after = JSON.stringify(applyCorrectionsDeep(JSON.parse(before), corrections));
-    if (after === before) continue;
-    updateArtifact.run(after, row.id as string);
+    const parsed = JSON.parse(before);
+    // Likewise the brief's open questions, which name the alternatives.
+    const questions = row.kind === 'brief' ? parsed.openQuestions : undefined;
+    const corrected = applyCorrectionsDeep(parsed, corrections);
+    if (questions !== undefined) corrected.openQuestions = questions;
+    const after = JSON.stringify(corrected);
+
+    const scopeBefore = (row.scope_key as string | null) ?? null;
+    const scopeAfter = scopeBefore
+      ? applyCorrections(applyCorrections(scopeBefore, slugCorrections), corrections)
+      : null;
+
+    if (after === before && scopeAfter === scopeBefore) continue;
+    updateArtifact.run(after, scopeAfter, row.id as string);
     artifacts++;
+  }
+
+  // Jobs are scoped the same way, so their history stays attached too.
+  const updateJob = db.prepare('UPDATE agent_jobs SET scope_key = ? WHERE id = ?');
+  for (const row of db
+    .prepare('SELECT id, scope_key FROM agent_jobs WHERE project_id = ? AND scope_key IS NOT NULL')
+    .all(projectId) as Record<string, unknown>[]) {
+    const before = row.scope_key as string;
+    const after = applyCorrections(applyCorrections(before, slugCorrections), corrections);
+    if (after !== before) updateJob.run(after, row.id as string);
   }
 
   let assets = 0;

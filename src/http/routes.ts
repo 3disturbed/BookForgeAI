@@ -11,7 +11,8 @@ import { APPROVAL_GATES, type ApprovalGate } from '../domain/states.js';
 import { storageKey } from '../domain/storage-paths.js';
 import { confirmPayment, createCheckoutSession, verifyWebhook } from '../billing/checkout.js';
 import { advanceProject, applyApproval, workerStatus } from '../queue/orchestrator.js';
-import { blobExists, blobExistsSync, signedUrlFor } from '../storage/blobs.js';
+import { blobExists, blobExistsSync, putBlob, signedUrlFor } from '../storage/blobs.js';
+import { generateImage } from '../ai/openai.js';
 import * as repo from '../store/repo.js';
 import { issueSession, clearSession, currentUserId, ownedProject, requireUser, userIdOf } from './auth.js';
 import { validateAnswers } from './decisions.js';
@@ -150,11 +151,21 @@ api.post('/projects/:id/retry', (req: Request, res: Response) => {
 api.post('/projects/:id/repair-terms', (req: Request, res: Response) => {
   const project = ownedProject(req, param(req, 'id'));
 
+  const body = z
+    .object({
+      corrections: z
+        .array(z.object({ wrong: z.string().min(1).max(200), right: z.string().min(1).max(200) }))
+        .optional(),
+    })
+    .safeParse(req.body ?? {});
+  if (!body.success) throw new BadRequestError('Corrections must be {wrong, right} pairs');
+
   const decisions = repo.latestArtifact<{
     answers: { question: string; answer: string; delegated: boolean }[];
   }>(project.id, 'decisions');
 
-  const corrections = (decisions?.data.answers ?? [])
+  // Explicit corrections win, so a term that was never a question can be fixed.
+  const corrections = body.data.corrections ?? (decisions?.data.answers ?? [])
     .filter((a) => !a.delegated && a.answer.trim())
     .flatMap((a) => deriveCorrections(a.question, a.answer));
 
@@ -306,6 +317,81 @@ function openQuestionsFor(projectId: string) {
   };
 }
 
+/**
+ * Re-renders one canon asset's reference sheet, optionally from a prompt the
+ * author has edited. The reference sheet is what every later illustration of
+ * that asset is matched against, so being able to steer it is the difference
+ * between accepting the model's first idea and directing the book's look.
+ */
+api.post('/projects/:id/assets/:assetId/regenerate', async (req: Request, res: Response) => {
+  const project = ownedProject(req, param(req, 'id'));
+  const asset = repo.getVisualAsset(param(req, 'assetId'));
+  if (!asset || asset.projectId !== project.id) throw new NotFoundError('visual asset');
+
+  const body = z
+    .object({
+      prompt: z.string().min(1).max(4000).optional(),
+      negativePrompt: z.string().max(2000).optional(),
+    })
+    .safeParse(req.body ?? {});
+  if (!body.success) throw new BadRequestError('Provide a prompt to render');
+
+  const existing = repo.latestArtifact<{
+    assetName: string;
+    bible: Record<string, unknown>;
+    referencePrompts: string[];
+    negativePrompts: string[];
+  }>(project.id, 'reference_package', slug(asset.name));
+
+  const prompt = body.data.prompt ?? existing?.data.referencePrompts?.[0];
+  if (!prompt) {
+    throw new BadRequestError('This asset has no reference prompt yet; supply one');
+  }
+  const negatives = body.data.negativePrompt !== undefined
+    ? [body.data.negativePrompt].filter(Boolean)
+    : (existing?.data.negativePrompts ?? []);
+
+  const negativeClause = negatives.length ? ` Avoid: ${negatives.join('; ')}.` : '';
+  const image = await generateImage({ prompt: prompt + negativeClause, aspectRatio: '1:1' });
+
+  // A new file each time, so the previous sheet stays available for comparison.
+  const key = storageKey(
+    project.id, 'assets', `${slug(asset.name)}-reference-v${asset.version + 1}.png`,
+  );
+  await putBlob(key, image.png);
+  repo.promoteAssetReferenceImage(asset.id, key);
+
+  // An edited prompt becomes the asset's canonical one.
+  if (existing && (body.data.prompt || body.data.negativePrompt !== undefined)) {
+    repo.writeArtifact({
+      projectId: project.id,
+      kind: 'reference_package',
+      scopeKey: slug(asset.name),
+      producedByJobId: null,
+      data: { ...existing.data, referencePrompts: [prompt], negativePrompts: negatives },
+    });
+  }
+
+  // New artwork is a change, so the canon needs approving again.
+  repo.setAssetStatus(asset.id, 'review');
+  repo.setApproval({
+    projectId: project.id, gate: 'visual_canon', approved: false,
+    actor: userIdOf(req), note: `regenerated ${asset.name}`,
+  });
+
+  repo.recordUsage({
+    projectId: project.id, jobId: null,
+    usage: { imageGenerations: 1, imageInputImages: image.referenceCount },
+  });
+
+  res.json({
+    asset: repo.getVisualAsset(asset.id),
+    url: signedUrlFor(key, project.id).url,
+    prompt,
+    negativePrompts: negatives,
+  });
+});
+
 /* ---------------------------- artifacts ---------------------------- */
 
 api.get('/projects/:id/artifacts/:kind', (req: Request, res: Response) => {
@@ -353,6 +439,13 @@ api.get('/projects/:id/assets', (req: Request, res: Response) => {
       importance: asset.importance,
       canonicalDescription: asset.canonicalDescription,
       referencePackage: packages.get(slug(asset.name)) ?? null,
+      version: asset.version,
+      referencePrompt:
+        (packages.get(slug(asset.name)) as { referencePrompts?: string[] } | undefined)
+          ?.referencePrompts?.[0] ?? '',
+      negativePrompt:
+        ((packages.get(slug(asset.name)) as { negativePrompts?: string[] } | undefined)
+          ?.negativePrompts ?? []).join('; '),
       referenceImages: asset.referenceImageKeys.map((key) => signedUrlFor(key, project.id).url),
     })),
   );
