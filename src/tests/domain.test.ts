@@ -1,6 +1,8 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 
+import { assemblePageModel, manuscriptDigest, normaliseHeading, pageDigest } from '../domain/page-model.js';
+
 import { evaluateAcceptance } from '../domain/acceptance.js';
 import { AGENTS, AGENT_NAMES } from '../domain/agents.js';
 import { addUsage, computeMargin, EMPTY_USAGE, DEFAULT_RATES } from '../domain/costs.js';
@@ -360,4 +362,242 @@ test('a budget spent on issues below critical ends the loop instead of escalatin
   assert.equal(revisionDecision({ cycle: 3, maxCycles: 3, openCriticalIssues: 0, openIssues: 2 }), 'pass');
   assert.equal(revisionDecision({ cycle: 3, maxCycles: 3, openCriticalIssues: 1, openIssues: 2 }), 'escalate');
   assert.equal(revisionDecision({ cycle: 0, maxCycles: 3, openCriticalIssues: 0, openIssues: 0 }), 'pass');
+});
+
+
+test('context digests carry only what their agent acts on', async () => {
+  const { __testing } = await import('../agents/runner.js');
+  const outline = {
+    chapters: [
+      { number: 1, title: 'A', summary: 'a', beats: ['x'] },
+      { number: 2, title: 'B', summary: 'b', beats: ['y'] },
+      { number: 3, title: 'C', summary: 'c', beats: ['z'] },
+    ],
+  };
+  assert.deepEqual(__testing.bookSpine(outline), [
+    { number: 1, title: 'A', summary: 'a' },
+    { number: 2, title: 'B', summary: 'b' },
+    { number: 3, title: 'C', summary: 'c' },
+  ]);
+  const last = __testing.outlineNeighbours(outline, 3);
+  assert.equal(last.previous?.number, 2);
+  assert.equal(last.next, null);
+  assert.deepEqual(__testing.outlineNeighbours(null, 1), { previous: null, next: null });
+
+  const registry = {
+    assets: [
+      { name: 'Mara', type: 'character', importance: 'primary', canonicalDescription: { hair: 'grey' } },
+      { name: 'Barrel', type: 'prop', importance: 'background', canonicalDescription: {} },
+    ],
+  };
+  assert.deepEqual(__testing.assetRegistryDigest(registry), {
+    assets: [
+      { name: 'Mara', type: 'character', importance: 'primary' },
+      { name: 'Barrel', type: 'prop', importance: 'background' },
+    ],
+  });
+  assert.deepEqual(__testing.registryForProse(registry).assets?.map((a) => a.name), ['Mara']);
+  assert.deepEqual(__testing.registryForProse(null), { assets: [] });
+
+  const map = {
+    entities: [{ name: 'Mara Vell', kind: 'character', description: 'long', aliases: ['Mara'] }],
+    locations: [{ name: 'Kell Point', description: 'shale' }],
+  };
+  assert.deepEqual(__testing.canonicalNamesDigest(map), {
+    entities: [{ name: 'Mara Vell', kind: 'character', aliases: ['Mara'] }],
+    locations: ['Kell Point'],
+  });
+  assert.deepEqual(__testing.canonicalNamesDigest(null), { entities: [], locations: [] });
+
+  // A scene render keeps the identity facts and the author-curated negatives;
+  // only the reference-sheet prompts are the designer's own business.
+  assert.deepEqual(
+    __testing.packageForScenes({
+      assetName: 'Mara', bible: { eyes: 'grey' }, referencePrompts: ['x'], negativePrompts: ['spectacles'],
+    }),
+    { assetName: 'Mara', bible: { eyes: 'grey' }, negativePrompts: ['spectacles'] },
+  );
+  assert.deepEqual(
+    __testing.packageForScenes({ assetName: 'Mara', bible: {} }),
+    { assetName: 'Mara', bible: {}, negativePrompts: [] },
+  );
+});
+
+test('the page model is assembled from the manuscript, never retyped', () => {
+  const chapters = [
+    {
+      number: 1, title: 'The Watch',
+      blocks: [
+        { type: 'heading', text: 'The Watch', level: 2 },
+        { type: 'paragraph', text: 'The lamp turned all night.' },
+        { type: 'break', text: '' },
+        { type: 'dialogue', text: '"You saw it too," she said.' },
+        { type: 'paragraph', text: 'By morning the water had gone the colour of old tin.' },
+      ],
+    },
+    { number: 2, title: 'The Answer', blocks: [{ type: 'paragraph', text: 'Something answered.' }] },
+  ];
+
+  // Layout sees lengths and headings, not prose; a heading that repeats the title is marked.
+  const digest = manuscriptDigest(chapters);
+  assert.equal(JSON.stringify(digest).includes('The lamp turned'), false);
+  assert.deepEqual(digest[0]!.blocks[0], { i: 0, type: 'heading', words: 2, text: 'The Watch', level: 2, isTitle: true });
+  assert.deepEqual(digest[0]!.blocks[1], { i: 1, type: 'paragraph', words: 5 });
+
+  const planned = {
+    template: 'novel', pageSize: 'digest', margins: { top: 1, bottom: 1, inner: 1, outer: 1 },
+    pages: [
+      { index: 1, kind: 'cover', blocks: [{ type: 'heading', text: 'Book', level: 1 }] },
+      // Layout wrote its own chapter heading and left the title block out,
+      // skipped block 2, and reversed a range.
+      {
+        index: 2, kind: 'body',
+        blocks: [
+          { type: 'heading', text: '1. The Watch', level: 2 },
+          { type: 'text', text: '', ref: { chapter: 1, from: 1, to: 1 } },
+          { type: 'text', text: '', ref: { chapter: 1, from: 4, to: 3 } },
+          { type: 'page_number', text: '9' },
+        ],
+      },
+      // Prose already placed, again: placed once, and the emptied page is dropped.
+      { index: 3, kind: 'body', blocks: [{ type: 'text', text: '', ref: { chapter: 1, from: 3, to: 4 } }] },
+      { index: 4, kind: 'back_matter', blocks: [{ type: 'text', text: 'The end.' }] },
+    ],
+  };
+  const { data, relocated } = assemblePageModel(planned, chapters);
+  const model = data as typeof planned;
+
+  assert.deepEqual(model.pages.map((p) => p.kind), ['cover', 'body', 'body', 'back_matter']);
+  assert.deepEqual(model.pages.map((p) => p.index), [1, 2, 3, 4], 'pages are renumbered after the drop');
+  assert.deepEqual(model.pages[1]!.blocks, [
+    { type: 'heading', text: '1. The Watch', level: 2 },
+    { type: 'text', text: 'The lamp turned all night.' },
+    { type: 'decoration', text: '' },
+    { type: 'text', text: '"You saw it too," she said.' },
+    { type: 'text', text: 'By morning the water had gone the colour of old tin.' },
+    { type: 'page_number', text: '2' },
+  ], 'the skipped break is back in place, the reversed range reads in order, the folio follows the page');
+  assert.equal(relocated, 2, 'the skipped break and the chapter never referred to');
+
+  // Chapter 2 was never referred to: a page of its own after chapter 1, before the back matter.
+  assert.deepEqual(model.pages[2], {
+    index: 3, kind: 'body',
+    blocks: [{ type: 'heading', text: '2. The Answer', level: 2 }, { type: 'text', text: 'Something answered.' }],
+  });
+  assert.ok(model.pages.every((p) => p.blocks.every((b) => !('ref' in b))), 'no reference survives assembly');
+
+  // Two chapters claiming one number cannot hide each other's prose.
+  const clash = assemblePageModel(
+    { pages: [{ index: 1, kind: 'body', blocks: [{ type: 'text', text: '', ref: { chapter: 1, from: 0, to: 0 } }] }] },
+    [
+      { number: 1, title: 'A', blocks: [{ type: 'paragraph', text: 'First.' }] },
+      { number: 1, title: 'B', blocks: [{ type: 'paragraph', text: 'Second.' }] },
+    ],
+  );
+  const clashed = clash.data as { pages: { blocks: { text?: string }[] }[] };
+  assert.deepEqual(clashed.pages.flatMap((p) => p.blocks.map((b) => b.text)), ['First.', '1. B', 'Second.']);
+  assert.equal(clash.relocated, 1);
+
+  // A manuscript heading that repeats the layout's own chapter heading is not set twice.
+  const titled = assemblePageModel(
+    {
+      pages: [{
+        index: 1, kind: 'body',
+        blocks: [
+          { type: 'heading', text: 'Chapter 6: Hidden Paths', level: 2 },
+          { type: 'text', text: '', ref: { chapter: 6, from: 0, to: 1 } },
+        ],
+      }],
+    },
+    [{
+      number: 6, title: 'Hidden Paths',
+      blocks: [{ type: 'heading', text: 'Hidden Paths', level: 2 }, { type: 'paragraph', text: 'Knock.' }],
+    }],
+  );
+  const titledPages = (titled.data as { pages: { blocks: { text?: string }[] }[] }).pages;
+  assert.deepEqual(titledPages[0]!.blocks.map((b) => b.text), ['Chapter 6: Hidden Paths', 'Knock.']);
+  assert.equal(titled.relocated, 0);
+
+  // Proof sees structure, plus the text on pages that carry no prose, and the folios.
+  const proof = pageDigest(model);
+  assert.equal(JSON.stringify(proof).includes('The lamp turned'), false);
+  assert.deepEqual(proof.pages[1]!.blocks[1], { type: 'text', words: 5 });
+  assert.deepEqual(proof.pages[1]!.blocks[5], { type: 'page_number', text: '2' });
+  assert.deepEqual(proof.pages[3]!.blocks[0], { type: 'text', text: 'The end.' });
+});
+
+test('assembly repairs what the layout got wrong without doubling anything', () => {
+  const chapters = [
+    { number: 3, title: 'Three', blocks: [{ type: 'paragraph', text: 'Three one.' }, { type: 'paragraph', text: 'Three two.' }] },
+    { number: 4, title: 'The Storm', blocks: [{ type: 'paragraph', text: 'Storm one.' }, { type: 'paragraph', text: 'Storm two.' }] },
+    { number: 5, title: 'Five', blocks: [{ type: 'paragraph', text: 'Five one.' }] },
+  ];
+  const page = (index: number, blocks: unknown[], kind = 'body') => ({ index, kind, blocks });
+  const texts = (data: unknown) =>
+    (data as { pages: { blocks: { text?: string }[] }[] }).pages.map((p) => p.blocks.map((b) => b.text ?? ''));
+
+  // A chapter whose references all failed keeps the page the layout opened for it.
+  const mistyped = assemblePageModel({ pages: [
+    page(1, [{ type: 'heading', text: '3. Three', level: 2 }, { type: 'text', ref: { chapter: 3, from: 0, to: 1 } }]),
+    page(2, [{ type: 'heading', text: '4. The Storm', level: 2 }, { type: 'text', ref: { chapter: 40, from: 0, to: 1 } }]),
+    page(3, [{ type: 'heading', text: '5. Five', level: 2 }, { type: 'text', ref: { chapter: 5, from: 0, to: 0 } }]),
+  ] }, chapters);
+  assert.deepEqual(texts(mistyped.data), [
+    ['3. Three', 'Three one.', 'Three two.'],
+    ['4. The Storm', 'Storm one.', 'Storm two.'],
+    ['5. Five', 'Five one.'],
+  ]);
+  assert.equal(mistyped.relocated, 2);
+
+  // A chapter the layout forgot goes in before the next one, so a plate stays with the chapter before it.
+  const forgotten = assemblePageModel({ pages: [
+    page(1, [{ type: 'text', ref: { chapter: 3, from: 0, to: 1 } }]),
+    page(2, [{ type: 'image', storageKey: 'k' }, { type: 'caption', text: 'Three, illustrated.' }], 'plate'),
+    page(3, [{ type: 'heading', text: '5. Five', level: 2 }, { type: 'text', ref: { chapter: 5, from: 0, to: 0 } }]),
+  ] }, chapters);
+  assert.deepEqual(texts(forgotten.data), [
+    ['Three one.', 'Three two.'],
+    ['', 'Three, illustrated.'],
+    ['4. The Storm', 'Storm one.', 'Storm two.'],
+    ['5. Five', 'Five one.'],
+  ]);
+
+  // A page left holding only a folio is not printed.
+  const folio = assemblePageModel({ pages: [
+    page(1, [{ type: 'text', ref: { chapter: 5, from: 0, to: 0 } }, { type: 'page_number', text: '1' }]),
+    page(2, [{ type: 'text', ref: { chapter: 5, from: 0, to: 0 } }, { type: 'page_number', text: '2' }]),
+  ] }, [chapters[2]!]);
+  assert.equal((folio.data as { pages: unknown[] }).pages.length, 1);
+
+  // Prose the layout typed out instead of referring to is placed once, in the manuscript's bytes.
+  const retyped = assemblePageModel({ pages: [
+    page(1, [{ type: 'text', text: 'Storm   one.' }, { type: 'text', ref: { chapter: 4, from: 1, to: 1 } }]),
+  ] }, [chapters[1]!]);
+  assert.deepEqual(texts(retyped.data), [['Storm one.', 'Storm two.']]);
+  assert.equal(retyped.relocated, 0);
+
+  // A section heading that repeats the title after prose has begun is an
+  // ordinary block: not marked, and put back if the layout leaves it out.
+  const titled = [{
+    number: 2, title: 'The Crossing',
+    blocks: [
+      { type: 'heading', text: 'The Crossing', level: 1 },
+      { type: 'paragraph', text: 'Before.' },
+      { type: 'heading', text: 'The Crossing', level: 3 },
+      { type: 'paragraph', text: 'After.' },
+    ],
+  }];
+  assert.deepEqual(manuscriptDigest(titled)[0]!.blocks.map((b) => 'isTitle' in b), [true, false, false, false]);
+  const sectioned = assemblePageModel({ pages: [
+    page(1, [
+      { type: 'heading', text: '2. The Crossing', level: 2 },
+      { type: 'text', ref: { chapter: 2, from: 1, to: 1 } },
+      { type: 'text', ref: { chapter: 2, from: 3, to: 3 } },
+    ]),
+  ] }, titled);
+  assert.deepEqual(texts(sectioned.data), [['2. The Crossing', 'Before.', 'The Crossing', 'After.']]);
+  assert.equal(sectioned.relocated, 1);
+
+  assert.equal(normaliseHeading('Chapter 12'), 'chapter 12', 'a title that is only a number keeps its text');
+  assert.equal(normaliseHeading('Chapter 3: The Crossing'), 'the crossing');
 });

@@ -1,6 +1,9 @@
 # BookForgeAI — PDF Pipeline
 
-The PDF is generated from a structured page model, not raw Markdown.
+The PDF is generated from a structured page model, not raw Markdown. Layout
+places body prose by reference to clean-manuscript blocks; the text is filled
+in from the manuscript when the page model is committed, so no paragraph the
+copy editor approved is retyped by a model on its way to the page.
 
 ```text
 BookProject → Edition Snapshot → Page Model → Layout → Rendered PDF → PDF QA → Approved PDF

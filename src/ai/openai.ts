@@ -88,7 +88,9 @@ export interface StructuredResult<T> {
  * data and defending against prompt injection.
  */
 export function asUntrustedData(label: string, value: unknown): string {
-  const body = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  // Compact on purpose: pretty-printing a knowledge map is hundreds of lines
+  // of indentation, all billed as input, and the model reads both the same.
+  const body = typeof value === 'string' ? value : JSON.stringify(value);
   return [
     `<${label}>`,
     body,
@@ -103,7 +105,7 @@ const INJECTION_GUARD =
 
 function jsonSchemaFor(schema: z.ZodTypeAny): string {
   try {
-    return JSON.stringify(z.toJSONSchema(schema, { io: 'input' }), null, 2);
+    return JSON.stringify(z.toJSONSchema(schema, { io: 'input' }));
   } catch {
     // Some refinements cannot be expressed as JSON Schema; the zod parse below
     // remains the authority either way.

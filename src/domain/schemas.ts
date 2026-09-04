@@ -346,6 +346,17 @@ export const PageModelSchema = z.object({
               level: z.number().int().min(1).max(6).optional(),
               storageKey: z.string().optional(),
               rows: z.array(z.array(z.string())).optional(),
+              /**
+               * Manuscript blocks to fill this block from, `from` to `to`
+               * inclusive; resolved from the clean manuscript at commit.
+               */
+              ref: z
+                .object({
+                  chapter: z.number().int().positive(),
+                  from: z.number().int().min(0),
+                  to: z.number().int().min(0),
+                })
+                .optional(),
             }),
           )
           .default([]),

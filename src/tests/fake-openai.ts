@@ -16,6 +16,18 @@ const CHAPTER_BLOCKS = [
   { type: 'paragraph', text: 'By morning the water had gone the colour of old tin.' },
 ];
 
+/** Distinct prose per chapter, so a test can tell whose text landed where. */
+function chapterBlocks(n: number): typeof CHAPTER_BLOCKS {
+  if (n === 1) return CHAPTER_BLOCKS;
+  return [
+    { type: 'heading', text: `Signals, Night ${n}`, level: 2 },
+    { type: 'paragraph', text: `On night ${n} a second light answered from the water.` },
+    { type: 'dialogue', text: '"It knows the pattern," Mara said.' },
+    { type: 'break', text: '' },
+    { type: 'paragraph', text: `She signalled back: ${n} long, one short.` },
+  ];
+}
+
 const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
   {
     match: 'You are the Discover agent',
@@ -140,7 +152,7 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
     body: (user) => ({
       number: chapterNumberFrom(user),
       title: 'The Watch',
-      blocks: CHAPTER_BLOCKS,
+      blocks: chapterBlocks(chapterNumberFrom(user)),
       wordCount: 1900,
       notes: [],
     }),
@@ -152,7 +164,7 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
       return {
         scenes: [
           {
-            key: `ch${n}-the-lamp`, chapterNumber: n,
+            key: `ch${n}-the-lamp`, chapterNumber: state.misnumberChapters ? 1 : n,
             assets: ['Mara Vell', 'The Lantern'], location: 'Kell Point',
             time: 'Night', weather: 'Fog', action: 'Mara trims the lamp.',
             emotion: 'Wary', camera: 'Low three-quarter', composition: 'Off-centre',
@@ -235,21 +247,22 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
     match: 'You are the Rewriter',
     body: (user) => ({
       number: chapterNumberFrom(user), title: 'The Watch',
-      blocks: CHAPTER_BLOCKS, wordCount: 1900, notes: [],
+      blocks: chapterBlocks(chapterNumberFrom(user)), wordCount: 1900, notes: [],
     }),
   },
   {
     match: 'You are the Editor',
     body: (user) => ({
       number: chapterNumberFrom(user), title: 'The Watch',
-      blocks: CHAPTER_BLOCKS, wordCount: 1880, notes: [],
+      blocks: chapterBlocks(chapterNumberFrom(user)), wordCount: 1880, notes: [],
     }),
   },
   {
     match: 'You are the Copy Editor',
     body: (user) => ({
-      number: chapterNumberFrom(user), title: 'The Watch',
-      blocks: CHAPTER_BLOCKS, wordCount: 1875, notes: [],
+      // The number a model writes is not trusted; a test can make it wrong.
+      number: state.misnumberChapters ? 1 : chapterNumberFrom(user), title: 'The Watch',
+      blocks: chapterBlocks(chapterNumberFrom(user)), wordCount: 1875, notes: [],
     }),
   },
   {
@@ -269,7 +282,8 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
           index: 3, kind: 'body',
           blocks: [
             { type: 'heading', text: '1. The Watch', level: 2 },
-            { type: 'text', text: 'The lamp turned all night, and all night something turned with it.' },
+            // Prose is referred to, never retyped; the runner fills it in.
+            { type: 'text', ref: { chapter: 1, from: 0, to: 4 } },
             { type: 'page_number', text: '3' },
           ],
         },
@@ -278,6 +292,13 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
           blocks: [
             { type: 'image', text: '', storageKey: 'REPLACED_AT_RUNTIME' },
             { type: 'caption', text: 'Mara at the lamp.' },
+          ],
+        },
+        {
+          index: 5, kind: 'body',
+          blocks: [
+            { type: 'heading', text: '2. The Answer', level: 2 },
+            { type: 'text', ref: { chapter: 2, from: 0, to: 4 } },
           ],
         },
       ],
@@ -312,7 +333,9 @@ function demandedSeverity(): 'critical' | 'major' | null {
 }
 
 function chapterNumberFrom(user: string): number {
-  const scope = /ch(\d+)/.exec(user);
+  // A scope key when the context carries one; otherwise the first numbered
+  // artifact in the context (the chapter outline, or the chapter itself).
+  const scope = /ch(\d+)/.exec(user) ?? /"number":\s*(\d+)/.exec(user);
   return scope ? Number(scope[1]) : 1;
 }
 
@@ -327,6 +350,8 @@ export const state = {
   demandMajorRewrites: 0,
   /** Diagnoses that emit a critical task whatever the critics raised; the runner must clamp it. */
   inflateDiagnosis: 0,
+  /** When true, the copy editor and scene composer write chapter 1's number on every chapter. */
+  misnumberChapters: false,
   /** When set, chat calls whose system prompt contains this text return JSON that fails every schema. */
   breakSchemaFor: '' as string,
   /**
@@ -367,6 +392,8 @@ export interface FakeOpenAI {
   calls: { agent: string }[];
   /** The user content of the most recent chat call, for asserting context. */
   lastUserMessage: string;
+  /** The most recent user content per fixture, keyed by the fixture's match text. */
+  userMessages: Map<string, string>;
 }
 
 export async function startFakeOpenAI(): Promise<FakeOpenAI> {
@@ -446,6 +473,7 @@ export async function startFakeOpenAI(): Promise<FakeOpenAI> {
 
       calls.push({ agent: fixture.match });
       handle.lastUserMessage = user;
+      handle.userMessages.set(fixture.match, user);
       res.end(JSON.stringify({
         id: 'chatcmpl-fake',
         choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify(fixture.body(user)) }, finish_reason: 'stop' }],
@@ -462,6 +490,7 @@ export async function startFakeOpenAI(): Promise<FakeOpenAI> {
     url: `http://127.0.0.1:${port}/v1`,
     calls,
     lastUserMessage: '',
+    userMessages: new Map(),
     close: () => new Promise<void>((closed) => server.close(() => closed())),
   };
 

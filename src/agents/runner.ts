@@ -12,6 +12,9 @@ import { applyCorrectionsDeep, deriveCorrections, type TermCorrection } from '..
 import { storageKey } from '../domain/storage-paths.js';
 import { addUsage, EMPTY_USAGE, hasSpend, type UsageRecord } from '../domain/costs.js';
 import {
+  assemblePageModel, manuscriptDigest, pageDigest, type ChapterLike,
+} from '../domain/page-model.js';
+import {
   asUntrustedData, EMPTY_TOKEN_USAGE, emptyImageSink, generateImage, generateStructured,
   type ImageSink, type TokenUsage,
 } from '../ai/openai.js';
@@ -130,6 +133,82 @@ function critiquesForChapter(projectId: string, chapterKey: string): unknown[] {
     .map((a) => a.data);
 }
 
+/* --------------------------- context digests ------------------------ */
+
+interface OutlineChapter { number: number; title: string; summary: string; [k: string]: unknown }
+interface OutlineLike { chapters?: OutlineChapter[] }
+
+/** Number, title and summary per chapter: the shape of the book without its beats. */
+function bookSpine(outline: OutlineLike | null): { number: number; title: string; summary: string }[] {
+  return (outline?.chapters ?? []).map((c) => ({ number: c.number, title: c.title, summary: c.summary }));
+}
+
+/** The chapters either side of this one, in full, so transitions can be written. */
+function outlineNeighbours(
+  outline: OutlineLike | null,
+  chapterNumber: number,
+): { previous: OutlineChapter | null; next: OutlineChapter | null } {
+  const chapters = outline?.chapters ?? [];
+  return {
+    previous: chapters.find((c) => c.number === chapterNumber - 1) ?? null,
+    next: chapters.find((c) => c.number === chapterNumber + 1) ?? null,
+  };
+}
+
+interface RegistryLike {
+  assets?: { name: string; type: string; importance: string; [k: string]: unknown }[];
+}
+
+/** Which assets exist: enough to choose moments, without their canonical descriptions. */
+function assetRegistryDigest(registry: RegistryLike | null): {
+  assets: { name: string; type: string; importance: string }[];
+} {
+  return {
+    assets: (registry?.assets ?? []).map((a) => ({ name: a.name, type: a.type, importance: a.importance })),
+  };
+}
+
+/** The registry without background props; prose needs the recurring assets' canon. */
+function registryForProse(registry: RegistryLike | null): RegistryLike {
+  return { assets: (registry?.assets ?? []).filter((a) => a.importance !== 'background') };
+}
+
+interface KnowledgeMapLike {
+  entities?: { name: string; kind: string; aliases?: string[]; [k: string]: unknown }[];
+  locations?: { name: string; [k: string]: unknown }[];
+}
+
+/** Names and aliases only: what standardising spelling needs from the knowledge map. */
+function canonicalNamesDigest(map: KnowledgeMapLike | null): {
+  entities: { name: string; kind: string; aliases: string[] }[];
+  locations: string[];
+} {
+  return {
+    entities: (map?.entities ?? []).map((e) => ({ name: e.name, kind: e.kind, aliases: e.aliases ?? [] })),
+    locations: (map?.locations ?? []).map((l) => l.name),
+  };
+}
+
+interface ReferencePackageLike {
+  assetName: string;
+  bible: Record<string, unknown>;
+  negativePrompts?: string[];
+  [k: string]: unknown;
+}
+
+/**
+ * What a scene render needs from a package: the identity facts and the
+ * asset's known failure modes, which are what the author edits at the canon
+ * gate. The reference-sheet prompts belong to the designer's own render.
+ */
+function packageForScenes(pkg: ReferencePackageLike): {
+  assetName: string;
+  bible: Record<string, unknown>;
+  negativePrompts: string[];
+} {
+  return { assetName: pkg.assetName, bible: pkg.bible, negativePrompts: pkg.negativePrompts ?? [] };
+}
+
 interface SceneLike {
   key: string;
   chapterNumber: number;
@@ -138,13 +217,26 @@ interface SceneLike {
   [k: string]: unknown;
 }
 
-/** Scene specs are written per chapter; scenes are addressed individually. */
-function findScene(projectId: string, sceneKey: string): SceneLike | null {
+/**
+ * Scene specs are written per chapter; scenes are addressed individually. The
+ * owning artifact's scope names the chapter; the number the model wrote into
+ * the scene is not trusted to.
+ */
+function locateScene(
+  projectId: string,
+  sceneKey: string,
+): { scene: SceneLike; chapterNumber: number } | null {
   for (const artifact of repo.latestArtifactsOfKind<{ scenes: SceneLike[] }>(projectId, 'scene_spec')) {
     const scene = artifact.data.scenes?.find((s) => s.key === sceneKey);
-    if (scene) return scene;
+    if (!scene) continue;
+    const fromScope = Number(artifact.scopeKey?.replace(/^ch/, ''));
+    return { scene, chapterNumber: Number.isFinite(fromScope) ? fromScope : scene.chapterNumber };
   }
   return null;
+}
+
+function findScene(projectId: string, sceneKey: string): SceneLike | null {
+  return locateScene(projectId, sceneKey)?.scene ?? null;
 }
 
 export function allScenes(projectId: string): SceneLike[] {
@@ -366,19 +458,26 @@ export async function executeAgent(
     /* -------------------------- writing -------------------------- */
 
     case 'author': {
-      const outline = requireSingle<{ chapters: { number: number }[] }>(project.id, 'outline');
+      const outline = requireSingle<OutlineLike>(project.id, 'outline');
       const chapterNumber = Number(job.scopeKey?.replace(/^ch/, '') ?? 0);
       const chapter = outline.chapters?.find((c) => c.number === chapterNumber);
       if (!chapter) {
         throw new BookForgeError('MISSING_INPUT', `Outline has no chapter ${chapterNumber}`, 409);
       }
 
+      // The whole outline was the largest thing the author received, and most
+      // of it is beats for other chapters. A chapter needs the spine of the
+      // book and its two neighbours in full.
       return reason([
         asUntrustedData('chapter_outline', chapter),
+        asUntrustedData('neighbouring_chapters', outlineNeighbours(outline, chapterNumber)),
+        asUntrustedData('book_spine', bookSpine(outline)),
         asUntrustedData('design_spec', requireSingle(project.id, 'design_spec')),
         asUntrustedData('knowledge_map', requireSingle(project.id, 'knowledge_map')),
-        asUntrustedData('asset_registry', readSingle(project.id, 'asset_registry') ?? {}),
-        asUntrustedData('full_outline', outline),
+        // Prose must describe a recurring character the same way every time,
+        // so the author keeps the canonical descriptions; background props are
+        // the ones it can do without.
+        asUntrustedData('asset_registry', registryForProse(readSingle(project.id, 'asset_registry'))),
       ]);
     }
 
@@ -407,11 +506,14 @@ export async function executeAgent(
     case 'diagnosis': {
       const scope = job.scopeKey ?? '';
       const critiques = critiquesForChapter(project.id, scope);
+      const outline = requireSingle<OutlineLike>(project.id, 'outline');
+      const chapterNumber = Number(scope.replace(/^ch/, ''));
       const outcome = await reason([
         asUntrustedData('critiques', critiques),
         asUntrustedData('chapter', currentChapter(project.id, scope) ?? {}),
         asUntrustedData('design_spec', requireSingle(project.id, 'design_spec')),
-        asUntrustedData('outline', requireSingle(project.id, 'outline')),
+        asUntrustedData('chapter_outline', outline.chapters?.find((c) => c.number === chapterNumber) ?? {}),
+        asUntrustedData('book_spine', bookSpine(outline)),
       ]);
       // Diagnosis merges critiques; it does not get to raise the stakes above
       // them. On the measured runs it invented critical tasks in rounds where
@@ -431,13 +533,23 @@ export async function executeAgent(
       ]);
     }
 
-    case 'editor':
-    case 'copy-editor': {
+    case 'editor': {
+      // Line editing acts on the prose and the style rules. The knowledge map
+      // was six thousand tokens the editor never declared it read.
       const scope = job.scopeKey ?? '';
       return reason([
         asUntrustedData('chapter', currentChapter(project.id, scope) ?? {}),
         asUntrustedData('design_spec', requireSingle(project.id, 'design_spec')),
-        asUntrustedData('knowledge_map', readSingle(project.id, 'knowledge_map') ?? {}),
+      ]);
+    }
+
+    case 'copy-editor': {
+      // Standardising spelling needs the names, not the map around them.
+      const scope = job.scopeKey ?? '';
+      return reason([
+        asUntrustedData('chapter', currentChapter(project.id, scope) ?? {}),
+        asUntrustedData('design_spec', requireSingle(project.id, 'design_spec')),
+        asUntrustedData('canonical_names', canonicalNamesDigest(readSingle(project.id, 'knowledge_map'))),
       ]);
     }
 
@@ -445,9 +557,11 @@ export async function executeAgent(
 
     case 'scene-composer': {
       const scope = job.scopeKey ?? '';
+      // Choosing moments needs to know which assets exist and how much they
+      // matter; the director restates their canon when the prompt is written.
       return reason([
         asUntrustedData('chapter', currentChapter(project.id, scope) ?? {}),
-        asUntrustedData('asset_registry', readSingle(project.id, 'asset_registry') ?? {}),
+        asUntrustedData('asset_registry', assetRegistryDigest(readSingle(project.id, 'asset_registry'))),
         asUntrustedData('design_spec', requireSingle(project.id, 'design_spec')),
         asUntrustedData('chapter_scope', scope),
       ]);
@@ -459,9 +573,9 @@ export async function executeAgent(
       if (!scene) throw new BookForgeError('MISSING_INPUT', `Scene "${sceneKey}" not found`, 409);
 
       const packages = repo
-        .latestArtifactsOfKind<{ assetName: string }>(project.id, 'reference_package')
+        .latestArtifactsOfKind<ReferencePackageLike>(project.id, 'reference_package')
         .filter((p) => scene.assets?.some((a) => slug(a) === p.scopeKey))
-        .map((p) => p.data);
+        .map((p) => packageForScenes(p.data));
 
       return reason([
         asUntrustedData('scene', scene),
@@ -539,9 +653,9 @@ export async function executeAgent(
 
       const scene = findScene(project.id, sceneKey);
       const packages = repo
-        .latestArtifactsOfKind<{ assetName: string }>(project.id, 'reference_package')
+        .latestArtifactsOfKind<ReferencePackageLike>(project.id, 'reference_package')
         .filter((p) => scene?.assets?.some((a) => slug(a) === p.scopeKey))
-        .map((p) => p.data);
+        .map((p) => packageForScenes(p.data));
 
       const images = [await getBlob(artwork.data.storageKey)];
       const result = await generateStructured({
@@ -582,11 +696,20 @@ export async function executeAgent(
     }
 
     case 'layout': {
+      // A chapter's identity is its scope key. The number the model wrote
+      // inside the artifact is not trusted to match it, and it is the key the
+      // layout's references resolve against.
       const chapters = repo
-        .latestArtifactsOfKind(project.id, 'clean_manuscript')
-        .map((a) => a.data);
+        .latestArtifactsOfKind<ChapterLike>(project.id, 'clean_manuscript')
+        .map((a) => {
+          const fromScope = Number(a.scopeKey?.replace(/^ch/, ''));
+          return { ...a.data, number: Number.isFinite(fromScope) ? fromScope : a.data.number };
+        })
+        .sort((a, b) => a.number - b.number);
       const artwork = repo
-        .latestArtifactsOfKind<{ sceneKey: string; storageKey: string }>(project.id, 'artwork')
+        .latestArtifactsOfKind<{ sceneKey: string; storageKey: string; width: number; height: number }>(
+          project.id, 'artwork',
+        )
         .map((a) => a.data);
       const approved = new Set(
         repo
@@ -594,15 +717,49 @@ export async function executeAgent(
           .filter((q) => q.data.passed)
           .map((q) => q.data.sceneKey),
       );
+      // Only QA-approved artwork is offered, each with what it depicts: the
+      // prose that used to say so is no longer sent, and a plate has to be
+      // placed against the right passage and captioned from something.
+      const illustrations = artwork
+        .filter((a) => approved.has(a.sceneKey))
+        .map((a) => {
+          const located = locateScene(project.id, a.sceneKey);
+          return {
+            sceneKey: a.sceneKey,
+            storageKey: a.storageKey,
+            width: a.width,
+            height: a.height,
+            chapterNumber: located?.chapterNumber ?? null,
+            action: String(located?.scene.action ?? ''),
+            location: String(located?.scene.location ?? ''),
+            assets: located?.scene.assets ?? [],
+          };
+        });
 
-      return reason([
+      const outcome = await reason([
         asUntrustedData('brief', requireSingle(project.id, 'brief')),
         asUntrustedData('architecture', requireSingle(project.id, 'architecture')),
         asUntrustedData('design_spec', requireSingle(project.id, 'design_spec')),
-        asUntrustedData('manuscript', chapters),
-        // Only QA-approved artwork is offered to layout.
-        asUntrustedData('available_illustrations', artwork.filter((a) => approved.has(a.sceneKey))),
+        // Layout plans pages from block types and lengths; it never sees the
+        // prose, so it cannot retype it.
+        asUntrustedData('manuscript_digest', manuscriptDigest(chapters)),
+        asUntrustedData('available_illustrations', illustrations),
       ]);
+      // The model refers to manuscript blocks; the text is filled in here, byte
+      // for byte from the clean manuscript, before the page model is committed.
+      const assembled = assemblePageModel(outcome.data, chapters);
+      outcome.data = assembled.data;
+      if (assembled.relocated > 0) {
+        // Prose the layout left out was put back where the manuscript has it;
+        // a person may still want to look at where.
+        outcome.afterCommit = () => repo.recordEvent({
+          projectId: project.id,
+          type: 'LAYOUT_REPAIRED',
+          actor: 'system',
+          payload: { relocatedBlocks: assembled.relocated },
+        });
+      }
+      return outcome;
     }
 
     case 'proof': {
@@ -634,7 +791,8 @@ export async function executeAgent(
           missingImages: render.missingImages,
         }),
         asUntrustedData('planned_pages', pageModel.pages?.length ?? 0),
-        asUntrustedData('page_model', pageModel.pages),
+        // Proof's checks are structural; the prose was most of its input.
+        asUntrustedData('page_digest', pageDigest(pageModel)),
       ]);
     }
 
@@ -879,4 +1037,7 @@ function isRetryable(error: unknown): boolean {
 }
 
 /** Exposed for unit tests only. */
-export const __testing = { normaliseArtifact, clampTaskSeverity };
+export const __testing = {
+  normaliseArtifact, clampTaskSeverity,
+  bookSpine, outlineNeighbours, assetRegistryDigest, registryForProse, canonicalNamesDigest, packageForScenes,
+};

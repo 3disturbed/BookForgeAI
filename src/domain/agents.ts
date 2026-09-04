@@ -145,7 +145,7 @@ export const AGENTS: Record<AgentName, AgentDefinition> = {
   },
   'copy-editor': {
     name: 'copy-editor', label: 'Copy Editor', capability: 'light', cardinality: 'chapter',
-    reads: ['edited_manuscript', 'design_spec'], writes: 'clean_manuscript',
+    reads: ['edited_manuscript', 'design_spec', 'knowledge_map'], writes: 'clean_manuscript',
     promptId: 'copy-editor',
   },
   continuity: {

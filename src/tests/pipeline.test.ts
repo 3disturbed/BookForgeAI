@@ -509,6 +509,112 @@ test('a budget spent on major issues alone ends the loop without escalating', as
   assert.equal(jobs.filter((j) => j.status === 'queued' || j.status === 'running').length, 0);
 });
 
+test('agents receive digests rather than whole artifacts, in compact JSON', async () => {
+  const user = repo.upsertUser('digest@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Digest', idea: 'A book that sends less.',
+  });
+  await drain(project.id);
+
+  const sent = (agent: string): string => {
+    const message = fake.userMessages.get(agent);
+    assert.ok(message, `${agent} was called`);
+    return message!;
+  };
+
+  const author = sent('You are the Author agent');
+  assert.ok(author.includes('<book_spine>') && author.includes('<neighbouring_chapters>'), 'the author gets the spine and its neighbours');
+  assert.ok(!author.includes('<full_outline>'), 'and not the whole outline');
+
+  assert.ok(!sent('You are the Editor').includes('<knowledge_map>'), 'the editor no longer gets the map');
+
+  const copy = sent('You are the Copy Editor');
+  assert.ok(copy.includes('<canonical_names>') && !copy.includes('<knowledge_map>'), 'the copy editor gets names, not the map');
+  assert.ok(copy.includes('Mara Vell') && copy.includes('Kell Point'), 'names and places survive the digest');
+
+  const composer = sent('You are the Scene Composer');
+  assert.ok(composer.includes('<asset_registry>') && !composer.includes('canonicalDescription'), 'the composer gets names and importance only');
+
+  const diagnosis = sent('You are the Diagnosis agent');
+  assert.ok(diagnosis.includes('<chapter_outline>') && diagnosis.includes('<book_spine>') && !diagnosis.includes('<outline>'));
+
+  const director = sent('You are the Image Director');
+  assert.ok(director.includes('"bible"') && !director.includes('referencePrompts'), 'packages arrive without the designer\'s render prompts');
+  assert.ok(director.includes('"negativePrompts":["modern clothing"]'), 'but with the asset\'s curated negatives');
+
+  // Layout plans structure; the prose reaches the page model from the clean
+  // manuscript, not from the model's output.
+  const layout = sent('You are the Layout agent');
+  assert.ok(layout.includes('<manuscript_digest>') && !layout.includes('The lamp turned all night'), 'layout gets a digest, not the prose');
+  assert.ok(layout.includes('Mara trims the lamp.') && layout.includes('"chapterNumber":1'), 'and knows what each plate depicts');
+  const proof = sent('You are the Proof agent');
+  assert.ok(proof.includes('<page_digest>') && !proof.includes('The lamp turned all night'), 'proof gets a digest, not the prose');
+
+  type Placed = { type: string; text: string; level?: number; ref?: unknown };
+  const pageModel = repo.latestArtifact<{ pages: { index: number; kind: string; blocks: Placed[] }[] }>(
+    project.id, 'page_model',
+  )!;
+  const pages = pageModel.data.pages;
+  assert.equal(pages.length, 5, 'the five planned pages, and no fallback page');
+  assert.ok(pages.every((p) => p.blocks.every((b) => b.ref === undefined)), 'references are resolved before commit');
+
+  // Each chapter's prose lands on the page that referred to it, in order, byte for byte.
+  const chapter = (n: number) =>
+    repo.latestArtifact<{ blocks: Placed[] }>(project.id, 'clean_manuscript', `ch${n}`)!.data.blocks;
+  const asPage = (blocks: Placed[]) => blocks.map((b) =>
+    b.type === 'heading' ? { type: 'heading', text: b.text, level: b.level ?? 3 }
+      : b.type === 'break' ? { type: 'decoration', text: '' }
+      : { type: 'text', text: b.text });
+  assert.notDeepEqual(chapter(1), chapter(2), 'the two chapters are distinguishable');
+  assert.deepEqual(pages[2]!.blocks, [
+    { type: 'heading', text: '1. The Watch', level: 2 },
+    ...asPage(chapter(1)),
+    { type: 'page_number', text: '3' },
+  ]);
+  assert.deepEqual(pages[4]!.blocks, [{ type: 'heading', text: '2. The Answer', level: 2 }, ...asPage(chapter(2))]);
+  assert.equal(
+    repo.listEvents(project.id, 300).filter((e) => e.type === 'LAYOUT_REPAIRED').length, 0,
+    'nothing had to be put back',
+  );
+
+  // Nothing is pretty-printed: indentation inside a data block is billed input.
+  for (const [agent, message] of fake.userMessages) {
+    assert.ok(!/\n {2,}"/.test(message), `${agent} received pretty-printed JSON`);
+  }
+});
+
+test('chapter identity comes from the scope key, not the number the model wrote', async () => {
+  fakeState.misnumberChapters = true;
+
+  const user = repo.upsertUser('misnumber@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Misnumber', idea: 'A book whose models misnumber chapters.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.misnumberChapters = false;
+  }
+
+  const layout = fake.userMessages.get('You are the Layout agent')!;
+  const block = (label: string): unknown =>
+    JSON.parse(new RegExp(`<${label}>\\n([\\s\\S]*?)\\n</${label}>`).exec(layout)![1]!);
+  const digest = block('manuscript_digest') as { number: number }[];
+  assert.deepEqual(digest.map((c) => c.number), [1, 2], 'the digest numbers chapters by scope');
+  const plates = block('available_illustrations') as { sceneKey: string; chapterNumber: number }[];
+  assert.ok(plates.length > 0, 'there are plates to place');
+  assert.ok(
+    plates.every((p) => p.chapterNumber === Number(/^ch(\d+)/.exec(p.sceneKey)![1])),
+    'plates are numbered by their scene spec\'s scope',
+  );
+
+  const pages = repo.latestArtifact<{ pages: { blocks: { text: string }[] }[] }>(project.id, 'page_model')!.data.pages;
+  assert.equal(pages.length, 5);
+  assert.ok(pages[4]!.blocks.some((b) => b.text.includes('night 2')), 'chapter 2\'s prose is on chapter 2\'s page');
+  assert.equal(repo.listEvents(project.id, 300).filter((e) => e.type === 'LAYOUT_REPAIRED').length, 0);
+});
+
 test('payment confirmation is idempotent', async () => {
   const user = repo.upsertUser('idem@example.com');
   const project = repo.createProject({ userId: user.id, title: 'T', idea: 'An idea for a book.' });
@@ -581,7 +687,13 @@ test('author decisions are recorded and reach every agent', async () => {
   const seen = fake.lastUserMessage;
   assert.ok(seen.includes('author_decisions'), 'decisions were attached to the agent call');
   assert.ok(seen.includes('Yes, the sea is sentient.'), 'the answer was passed through');
-  assert.ok(!seen.includes('"question": "ignored"'), 'delegated questions are not passed');
+  // Parsed, not string-matched: the serialisation is compact and may change.
+  const block = /<author_decisions>\n([\s\S]*?)\n<\/author_decisions>/.exec(seen);
+  assert.ok(block, 'the decisions block is well formed');
+  const passed = JSON.parse(block![1]!) as { question: string; answer: string }[];
+  assert.equal(passed.length, 1, 'only the answered question is passed');
+  assert.equal(passed[0]!.answer, 'Yes, the sea is sentient.');
+  assert.ok(!passed.some((a) => a.question === 'ignored'), 'delegated questions are not passed');
 });
 
 test('an answer to a question the brief never asked is rejected', async () => {

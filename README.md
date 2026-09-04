@@ -160,9 +160,13 @@ begins. Reference images are passed to the image model as inputs, and Visual QA
 checks every render against the canon. Consistency is probabilistic; the system
 reduces drift, it does not eliminate it.
 
-**The PDF.** Layout produces a structured page model — pages, blocks, images,
-captions — which a headless Chromium renderer turns into a PDF through print
-CSS: justified serif with hyphenation, orphan and widow control, small-caps
+**The PDF.** Layout plans a structured page model: pages, plates, images,
+captions, and body prose placed by reference to the clean manuscript, whose
+text is filled in when the model is committed, so no paragraph the copy editor
+approved is retyped on its way to the page; chapter headings and captions
+remain layout's own. A headless Chromium renderer turns
+it into a PDF through print CSS: justified serif with hyphenation, orphan and
+widow control, small-caps
 chapter openings, real tables. Structural pages (cover, front matter, plates)
 keep their own leaf; body prose is allowed to flow, so pages fill the way a
 typesetter would set them. Rendering happens inside the Proof job, so it is
