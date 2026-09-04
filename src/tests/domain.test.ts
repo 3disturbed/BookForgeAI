@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 
 import { assemblePageModel, manuscriptDigest, normaliseHeading, pageDigest } from '../domain/page-model.js';
+import { capScenes, matchAssetName, normaliseSceneAssets } from '../domain/scenes.js';
 
 import { evaluateAcceptance } from '../domain/acceptance.js';
 import { AGENTS, AGENT_NAMES } from '../domain/agents.js';
@@ -600,4 +601,56 @@ test('assembly repairs what the layout got wrong without doubling anything', () 
 
   assert.equal(normaliseHeading('Chapter 12'), 'chapter 12', 'a title that is only a number keeps its text');
   assert.equal(normaliseHeading('Chapter 3: The Crossing'), 'the crossing');
+});
+
+test('scene asset names are mapped onto the registry, and scenes are capped', () => {
+  const names = ['Toast (Warhound)', 'Captain Firebeard', 'The Lantern', 'Mara Vell'].map((name) => ({ name }));
+  assert.equal(matchAssetName('toast', names), 'Toast (Warhound)');
+  assert.equal(matchAssetName('Firebeard', names), 'Captain Firebeard');
+  assert.equal(matchAssetName('Lantern', names), 'The Lantern');
+  assert.equal(matchAssetName('Captain Firebeard the Red', names), 'Captain Firebeard');
+  assert.equal(matchAssetName('  MARA   VELL ', names), 'Mara Vell');
+  assert.equal(matchAssetName('Nobody', names), null);
+  assert.equal(matchAssetName('', names), null);
+
+  // A primary character's short name is never rewritten onto a prop or place
+  // that shares its words, whatever order the registry lists them in.
+  const shared = [
+    { name: "Mara Vell's Cottage", importance: 'background' },
+    { name: "Firebeard's Cutlass", importance: 'secondary' },
+    { name: 'Mara Vell', importance: 'primary' },
+    { name: 'Captain Firebeard', importance: 'primary' },
+    { name: 'The Lantern Room', importance: 'background' },
+    { name: 'Lantern', importance: 'primary' },
+  ];
+  assert.equal(matchAssetName('Mara', shared), 'Mara Vell');
+  assert.equal(matchAssetName('Firebeard', shared), 'Captain Firebeard');
+  assert.equal(matchAssetName('The Lantern', shared), 'Lantern');
+  // Two equally important candidates: the spelling is kept, not guessed.
+  const twins = [{ name: 'Tom Piper', importance: 'primary' }, { name: 'Tom Sawyer', importance: 'primary' }];
+  assert.equal(matchAssetName('Tom', twins), 'Tom');
+  // A stricter reading settles it before a looser one is consulted.
+  assert.equal(matchAssetName('Tom', [{ name: 'Old Tom' }, { name: 'Tom Piper' }]), 'Tom Piper');
+
+  const spec = {
+    scenes: [
+      { key: 'a', assets: ['toast', 'Toast', 'Nobody'], requiredReferences: ['lantern'] },
+      { key: 'b', assets: [] },
+      { key: 'c', assets: [] },
+    ],
+  };
+  const fixed = normaliseSceneAssets(spec, names) as typeof spec;
+  assert.deepEqual(fixed.scenes[0]!.assets, ['Toast (Warhound)'], 'spelt the registry way, once, the unknown dropped');
+  assert.deepEqual(fixed.scenes[0]!.requiredReferences, ['The Lantern']);
+  assert.deepEqual((capScenes(spec, 2) as typeof spec).scenes.map((s) => s.key), ['a', 'b']);
+  assert.deepEqual(capScenes({ notScenes: true }, 2), { notScenes: true });
+});
+
+test('a verdict passes only when nothing failed', async () => {
+  const { __testing } = await import('../agents/runner.js');
+  const base = { sceneKey: 's', recommendation: 'accept' };
+  assert.equal(__testing.passVerdict({ ...base, passed: false, checks: [{ result: 'warn' }], criticalFailures: [] }).passed, true);
+  assert.equal(__testing.passVerdict({ ...base, passed: true, checks: [{ result: 'fail' }], criticalFailures: [] }).passed, false);
+  assert.equal(__testing.passVerdict({ ...base, passed: true, checks: [], criticalFailures: ['wrong hair'] }).passed, false);
+  assert.equal(__testing.passVerdict({ ...base, passed: false }).passed, true);
 });

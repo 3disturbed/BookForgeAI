@@ -155,10 +155,16 @@ Exhausting the budget with critical issues still open escalates to a human
 rather than shipping silently.
 
 **Visual continuity.** Recurring characters, objects and locations get a
-canonical specification and approved reference art before ordinary illustration
-begins. Reference images are passed to the image model as inputs, and Visual QA
-checks every render against the canon. Consistency is probabilistic; the system
-reduces drift, it does not eliminate it.
+canonical specification before ordinary illustration begins, and those that
+carry the book (primary and secondary assets) get approved reference art too;
+background props keep their canon as text, since no scene ever asked for their
+sheet. Reference images are passed to the image model as inputs, and Visual QA
+judges every render against the canon with the primary asset's reference sheet
+beside it. A failed render is redone once, with the failed checks steering the
+retry; one that still fails is recorded and left for a person, and publication
+waits on it. Each chapter keeps at most `MAX_SCENES_PER_CHAPTER` scenes.
+Consistency is probabilistic; the system reduces drift, it does not eliminate
+it.
 
 **The PDF.** Layout plans a structured page model: pages, plates, images,
 captions, and body prose placed by reference to the clean manuscript, whose

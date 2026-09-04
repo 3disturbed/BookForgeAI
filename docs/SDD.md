@@ -28,7 +28,7 @@ Discover → Research → Map → Visual Canon → Asset Designer → Architect 
 
 ## 5. Visual Canon
 
-Before normal illustration begins, the system identifies recurring characters, creatures, animals, objects, vehicles, buildings, locations, clothing and props. Each receives a canonical specification and reference artwork. Approved assets can be locked. Changes create a new version.
+Before normal illustration begins, the system identifies recurring characters, creatures, animals, objects, vehicles, buildings, locations, clothing and props. Each receives a canonical specification; primary and secondary assets also receive reference artwork, while background props keep their canon as text (on the measured runs no scene ever called for a background prop's sheet). Approved assets can be locked. Changes create a new version.
 
 ## 6. Human approval gates
 

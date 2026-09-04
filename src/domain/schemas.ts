@@ -272,6 +272,8 @@ export const VisualQaResultSchema = z.object({
   criticalFailures: z.array(z.string()).default([]),
   /** Critical failures trigger rejection and regeneration. */
   recommendation: z.enum(['accept', 'regenerate', 'escalate']),
+  /** The artwork revision this verdict judged; set by the runner, not the model. */
+  artworkRevision: z.number().int().positive().optional(),
 });
 
 export const CritiqueSchema = z.object({

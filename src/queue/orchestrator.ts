@@ -14,8 +14,6 @@ import * as repo from '../store/repo.js';
 /** Stages that re-run each time the editorial loop goes round (SDD.md §7). */
 const LOOP_STAGES: ReadonlySet<StageId> = new Set(['criticise', 'diagnose', 'rewrite']);
 
-/** A scene gets one regeneration after a failed Visual QA before escalating. */
-const MAX_IMAGE_ATTEMPTS = 2;
 
 interface PlannedJob {
   scopeKey: string | null;
@@ -65,9 +63,12 @@ function planJobs(project: repo.ProjectRow, agent: AgentName, round = 0): Planne
     }
 
     case 'asset':
+      // Background props get no reference sheet: on the measured runs scenes
+      // never called for one, so the render bought no drift control. Their
+      // canon still reaches the director and QA as text.
       return repo
         .listVisualAssets(project.id)
-        .filter((a) => a.status !== 'retired')
+        .filter((a) => a.status !== 'retired' && a.importance !== 'background')
         .map((a) => ({ scopeKey: slug(a.name) }));
 
     case 'scene': {
@@ -446,35 +447,89 @@ function applyRevisionDecision(project: repo.ProjectRow): boolean {
 /* --------------------------- illustration --------------------------- */
 
 /** Re-renders scenes Visual QA rejected, up to the attempt cap. */
+/**
+ * Keeps the illustrate stage open while renders are still being judged or
+ * redone. Returns true when the stage must stay open.
+ *
+ * A render is judged only once it exists: the previous verdict was about the
+ * previous render, so QA for a regeneration is enqueued after the generator
+ * completes, never alongside it (enqueued together, the worker ran both at
+ * once and every regeneration on the measured run was graded against the old
+ * image). Only a canon violation earns another render; a verdict that would
+ * merely prefer a change does not, and neither does one that says another
+ * render will not help.
+ */
 function enqueueRegenerations(project: repo.ProjectRow): boolean {
-  const results = repo.latestArtifactsOfKind<{
-    sceneKey: string;
-    recommendation: string;
-  }>(project.id, 'visual_qa_result');
-
   const generatorJobs = repo.jobsForAgent(project.id, 'illustrate', 'image-generator');
+  const qaJobs = repo.jobsForAgent(project.id, 'illustrate', 'visual-qa');
+  const inFlight = (j: repo.JobRow) => j.status === 'queued' || j.status === 'running';
+  if (generatorJobs.some(inFlight) || qaJobs.some(inFlight)) return true;
+
+  // A regeneration that failed is left for a person to retry, and the stage
+  // stays open so the retried render is judged rather than orphaned.
+  const stuck = (j: repo.JobRow) => j.round > 0 && (j.status === 'failed' || j.status === 'blocked');
+  if (generatorJobs.some(stuck) || qaJobs.some(stuck)) {
+    setStatus(project.id, 'review');
+    return true;
+  }
+
   const attempts = new Map<string, number>();
   for (const job of generatorJobs) {
     if (!job.scopeKey) continue;
     attempts.set(job.scopeKey, (attempts.get(job.scopeKey) ?? 0) + 1);
   }
+  const judged = new Set(qaJobs.map((j) => `${j.scopeKey}@${j.round}`));
+
+  const verdicts = new Map(
+    repo
+      .latestArtifactsOfKind<{
+        sceneKey: string;
+        passed: boolean;
+        recommendation: string;
+        artworkRevision?: number;
+      }>(project.id, 'visual_qa_result')
+      // Keyed by artifact scope: identity is the job's scene, not a field the model echoed.
+      .map((r) => [r.scopeKey ?? r.data.sceneKey, r.data] as const),
+  );
 
   let enqueued = false;
-  for (const result of results) {
-    if (result.data.recommendation !== 'regenerate') continue;
-    const sceneKey = result.data.sceneKey;
-    if ((attempts.get(sceneKey) ?? 0) >= MAX_IMAGE_ATTEMPTS) continue;
+  const unresolved: string[] = [];
+  for (const artwork of repo.latestArtifactsOfKind<{ sceneKey: string; revision: number }>(project.id, 'artwork')) {
+    const sceneKey = artwork.scopeKey ?? artwork.data.sceneKey;
+    const revision = artwork.data.revision;
+    const verdict = verdicts.get(sceneKey);
+    // Revision N was rendered by generator round N-1 and is judged at that round.
+    const round = Math.max(0, revision - 1);
 
-    const round = (attempts.get(sceneKey) ?? 0);
-    repo.enqueueJob({
-      projectId: project.id, stage: 'illustrate', agent: 'image-generator',
-      scopeKey: sceneKey, round,
-    });
-    repo.enqueueJob({
-      projectId: project.id, stage: 'illustrate', agent: 'visual-qa',
-      scopeKey: sceneKey, round,
-    });
+    const unjudged = !verdict || (verdict.artworkRevision !== undefined && verdict.artworkRevision < revision);
+    if (unjudged) {
+      if (judged.has(`${sceneKey}@${round}`)) continue; // judged and failed to verdict: left for a person
+      repo.enqueueJob({ projectId: project.id, stage: 'illustrate', agent: 'visual-qa', scopeKey: sceneKey, round });
+      enqueued = true;
+      continue;
+    }
+
+    // Only a render that failed earns another. `passed` is derived at commit
+    // from the checks, so this is the same gate publication uses.
+    if (verdict.passed) continue;
+    const made = attempts.get(sceneKey) ?? 0;
+    if (verdict.recommendation === 'escalate' || made >= env().MAX_IMAGE_ATTEMPTS) {
+      unresolved.push(sceneKey);
+      continue;
+    }
+    repo.enqueueJob({ projectId: project.id, stage: 'illustrate', agent: 'image-generator', scopeKey: sceneKey, round: made });
     enqueued = true;
+  }
+
+  // A render still failing with its attempts spent is left for a person, and
+  // said so: publication stays blocked on it until it passes.
+  if (!enqueued && unresolved.length > 0) {
+    repo.recordEvent({
+      projectId: project.id,
+      type: 'ILLUSTRATION_UNRESOLVED',
+      actor: 'system',
+      payload: { scenes: unresolved },
+    });
   }
   return enqueued;
 }

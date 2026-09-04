@@ -37,6 +37,8 @@ before(async () => {
     ENABLE_ILLUSTRATIONS: 'true',
     MAX_REVISION_CYCLES: '3',
     REVISION_REREAD_SEVERITY: 'critical',
+    MAX_IMAGE_ATTEMPTS: '2',
+    MAX_SCENES_PER_CHAPTER: '2',
     APP_BASE_URL: 'http://localhost:3000',
   });
 
@@ -120,11 +122,15 @@ test('a project runs the full pipeline and publishes', async () => {
   assert.equal(chapters.length, 2, 'both chapters reached clean manuscript');
 
   const assets = repo.listVisualAssets(project.id);
-  assert.equal(assets.length, 2, 'visual canon registered its assets');
+  assert.equal(assets.length, 3, 'visual canon registered its assets, the background prop included');
   assert.ok(assets.every((a) => a.status === 'locked'), 'approving the canon locks assets');
+  // Background props get no sheet by design; everything that matters does.
+  const sheeted = assets.filter((a) => a.importance !== 'background');
+  assert.equal(sheeted.length, 2);
+  assert.ok(sheeted.every((a) => a.referenceImageKeys.length > 0), 'each primary asset got reference art');
   assert.ok(
-    assets.every((a) => a.referenceImageKeys.length > 0),
-    'each canon asset got reference art',
+    assets.filter((a) => a.importance === 'background').every((a) => a.referenceImageKeys.length === 0),
+    'a background prop got none',
   );
 
   const artwork = repo.latestArtifactsOfKind(project.id, 'artwork');
@@ -613,6 +619,210 @@ test('chapter identity comes from the scope key, not the number the model wrote'
   assert.equal(pages.length, 5);
   assert.ok(pages[4]!.blocks.some((b) => b.text.includes('night 2')), 'chapter 2\'s prose is on chapter 2\'s page');
   assert.equal(repo.listEvents(project.id, 300).filter((e) => e.type === 'LAYOUT_REPAIRED').length, 0);
+});
+
+test('a failed Visual QA regenerates once and judges the new render', async () => {
+  fakeState.failVisualQa = 1;
+
+  const user = repo.upsertUser('regen@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Regen', idea: 'A book whose first render fails QA.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.failVisualQa = 0;
+  }
+
+  const jobs = repo.listJobs(project.id, 800);
+  const regenerations = jobs.filter((j) => j.agent === 'image-generator' && j.round > 0);
+  assert.equal(regenerations.length, 1, 'one render was redone');
+  const scene = regenerations[0]!.scopeKey!;
+
+  const judgements = jobs
+    .filter((j) => j.agent === 'visual-qa' && j.scopeKey === scene)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  assert.equal(judgements.length, 2, 'the new render was judged again');
+  assert.ok(
+    judgements[1]!.createdAt >= regenerations[0]!.finishedAt!,
+    'and only once the new render existed',
+  );
+
+  assert.equal(repo.latestArtifact<{ revision: number }>(project.id, 'artwork', scene)!.data.revision, 2);
+  const verdict = repo.latestArtifact<{ artworkRevision?: number; passed: boolean }>(
+    project.id, 'visual_qa_result', scene,
+  )!.data;
+  assert.equal(verdict.artworkRevision, 2, 'the verdict names the render it judged');
+  assert.ok(verdict.passed);
+  assert.ok(repo.getProject(project.id)!.completedStages.includes('illustrate'));
+});
+
+test('a QA note without a canon violation does not buy another render', async () => {
+  fakeState.softRegenerateOnce = true;
+
+  const user = repo.upsertUser('soft@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Soft', idea: 'A book whose QA would merely prefer a change.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.softRegenerateOnce = false;
+  }
+
+  const jobs = repo.listJobs(project.id, 800);
+  assert.equal(jobs.filter((j) => j.agent === 'image-generator' && j.round > 0).length, 0, 'no regeneration');
+  assert.ok(repo.getProject(project.id)!.completedStages.includes('illustrate'));
+
+  // The same flag gates publication, so a warning cannot strand the book.
+  const verdicts = repo.latestArtifactsOfKind<{ passed: boolean; checks: { result: string }[] }>(project.id, 'visual_qa_result');
+  assert.ok(verdicts.some((v) => v.data.checks.some((c) => c.result === 'warn')), 'the warning was recorded');
+  assert.ok(verdicts.every((v) => v.data.passed), 'and the verdict passes');
+  assert.equal(repo.listEvents(project.id, 300).filter((e) => e.type === 'ILLUSTRATION_UNRESOLVED').length, 0);
+});
+
+test('a failed check without a canon violation still earns a second render', async () => {
+  fakeState.failCheckOnce = true;
+
+  const user = repo.upsertUser('failcheck@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Failcheck', idea: 'A book whose lamp came out bronze.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.failCheckOnce = false;
+  }
+
+  const jobs = repo.listJobs(project.id, 800);
+  const regenerations = jobs.filter((j) => j.agent === 'image-generator' && j.round > 0);
+  assert.equal(regenerations.length, 1, 'the failed render was redone');
+  const scene = regenerations[0]!.scopeKey!;
+  const verdict = repo.latestArtifact<{ passed: boolean; artworkRevision?: number }>(project.id, 'visual_qa_result', scene)!.data;
+  assert.equal(verdict.artworkRevision, 2);
+  assert.ok(verdict.passed, 'and the new render passed');
+});
+
+test('a render that keeps failing is recorded and left for a person once its attempts are spent', async () => {
+  fakeState.failVisualQa = 10;
+
+  const user = repo.upsertUser('unresolved@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Unresolved', idea: 'A book whose keeper never gets her scar.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.failVisualQa = 0;
+  }
+
+  const jobs = repo.listJobs(project.id, 800);
+  const perScene = new Map<string, number>();
+  for (const j of jobs.filter((j) => j.agent === 'image-generator')) {
+    perScene.set(j.scopeKey!, (perScene.get(j.scopeKey!) ?? 0) + 1);
+  }
+  assert.ok([...perScene.values()].every((n) => n === 2), 'every scene used exactly its two attempts');
+
+  const events = repo.listEvents(project.id, 300).filter((e) => e.type === 'ILLUSTRATION_UNRESOLVED');
+  assert.equal(events.length, 1, 'the unresolved renders were recorded once');
+  assert.deepEqual([...(events[0]!.payload.scenes as string[])].sort(), [...perScene.keys()].sort());
+
+  const verdicts = repo.latestArtifactsOfKind<{ passed: boolean; artworkRevision?: number }>(project.id, 'visual_qa_result');
+  assert.ok(verdicts.every((v) => v.data.artworkRevision === 2 && !v.data.passed), 'the last renders were judged, and failed');
+  assert.ok(repo.getProject(project.id)!.completedStages.includes('illustrate'), 'the book moved on, blocked at publication');
+});
+
+test('a refused regeneration keeps the stage open until the retry is judged', async () => {
+  // Two reference sheets, two renders, then the regeneration: the fifth image call.
+  fakeState.failVisualQa = 1;
+  fakeState.imageCalls = 0;
+  fakeState.refuseImageAt = 5;
+
+  const user = repo.upsertUser('refused@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Refused', idea: 'A book whose retry the model refuses.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.failVisualQa = 0;
+    fakeState.refuseImageAt = 0;
+  }
+
+  let jobs = repo.listJobs(project.id, 800);
+  const refused = jobs.filter((j) => j.agent === 'image-generator' && j.round > 0);
+  assert.equal(refused.length, 1);
+  assert.equal(refused[0]!.status, 'failed', 'the refused render is a failed job');
+  let after = repo.getProject(project.id)!;
+  assert.ok(!after.completedStages.includes('illustrate'), 'the stage waits for a person');
+  assert.equal(after.status, 'review');
+
+  // The person retries; the render is judged before the stage closes.
+  assert.equal(repo.retryFailedJobs(project.id), 1);
+  await drain(project.id);
+
+  jobs = repo.listJobs(project.id, 800);
+  after = repo.getProject(project.id)!;
+  const scene = refused[0]!.scopeKey!;
+  assert.equal(repo.latestArtifact<{ revision: number }>(project.id, 'artwork', scene)!.data.revision, 2);
+  const verdict = repo.latestArtifact<{ passed: boolean; artworkRevision?: number }>(project.id, 'visual_qa_result', scene)!.data;
+  assert.equal(verdict.artworkRevision, 2, 'the retried render was judged');
+  assert.ok(verdict.passed);
+  assert.equal(jobs.filter((j) => j.agent === 'visual-qa' && j.scopeKey === scene).length, 2);
+  assert.ok(after.completedStages.includes('proof'), 'and the book went on to completion');
+});
+
+test('background props get no reference art, and their canon still reaches the director', async () => {
+  const user = repo.upsertUser('background@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Background', idea: 'A book with a prop nobody needs a sheet for.',
+  });
+  await drain(project.id);
+
+  const jobs = repo.listJobs(project.id, 800);
+  assert.ok(!jobs.some((j) => j.agent === 'asset-designer' && j.scopeKey === 'tin-cup'), 'no sheet for a background prop');
+  assert.ok(jobs.some((j) => j.agent === 'asset-designer' && j.scopeKey === 'mara-vell'), 'primary assets still get one');
+  assert.ok(repo.listVisualAssets(project.id).some((a) => a.name === 'Tin Cup'), 'the prop is still registered');
+
+  const director = fake.userMessages.get('You are the Image Director')!;
+  const canon = JSON.parse(/<asset_canon>\n([\s\S]*?)\n<\/asset_canon>/.exec(director)![1]!) as { name: string }[];
+  assert.deepEqual(canon.map((a) => a.name), ['Tin Cup'], 'the canon block names the unpackaged prop, and only it');
+  assert.ok(director.includes('dented tin'), 'its canon reaches the director as text');
+  const qa = fake.userMessages.get('You are Visual QA')!;
+  assert.ok(qa.includes('dented tin'), 'and Visual QA');
+  assert.ok(qa.includes('<reference_sheet_for>\nMara Vell\n'), 'which is told whose sheet it is looking at');
+});
+
+test('scene specs are capped per chapter and their asset names mapped onto the registry', async () => {
+  fakeState.extraScenes = 2;
+
+  const user = repo.upsertUser('scenes@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Scenes', idea: 'A book whose composer offers too many scenes.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.extraScenes = 0;
+  }
+
+  const specs = repo.latestArtifactsOfKind<{
+    scenes: { key: string; assets: string[]; requiredReferences: string[] }[];
+  }>(project.id, 'scene_spec');
+  assert.equal(specs.length, 2);
+  for (const spec of specs) {
+    assert.equal(spec.data.scenes.length, 2, 'three were offered, two kept');
+    const extra = spec.data.scenes[1]!;
+    assert.deepEqual(extra.assets, ['Mara Vell', 'The Lantern'], 'spellings mapped, the unknown dropped');
+    assert.deepEqual(extra.requiredReferences, ['Mara Vell']);
+  }
+  assert.equal(repo.latestArtifactsOfKind(project.id, 'artwork').length, 4, 'two renders per chapter');
 });
 
 test('payment confirmation is idempotent', async () => {

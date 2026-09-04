@@ -78,6 +78,13 @@ const EnvSchema = z.object({
     .enum(['true', 'false'])
     .default('true')
     .transform((v) => v === 'true'),
+  /** Renders a scene may receive before a failed Visual QA is left to a person. */
+  MAX_IMAGE_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(2),
+  /**
+   * Scenes kept per chapter. Each one is a director call, a render and a QA
+   * call, and long books were producing three or four per chapter.
+   */
+  MAX_SCENES_PER_CHAPTER: z.coerce.number().int().min(1).max(6).default(2),
 
   /**
    * Unit prices, USD per million tokens unless stated. Copied by the operator

@@ -90,6 +90,13 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
           firstAppearance: 'Chapter 1',
           canonicalDescription: { material: 'brass', state: 'salt-pitted' },
         },
+        {
+          name: 'Tin Cup',
+          type: 'object',
+          importance: 'background',
+          firstAppearance: 'Chapter 1',
+          canonicalDescription: { material: 'dented tin' },
+        },
       ],
     }),
   },
@@ -161,16 +168,25 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
     match: 'You are the Scene Composer',
     body: (user) => {
       const n = chapterNumberFrom(user);
+      // Extra scenes spell asset names loosely and name one that does not exist.
+      const extra = Array.from({ length: state.extraScenes }, (_, i) => ({
+        key: `ch${n}-extra-${i + 1}`, chapterNumber: state.misnumberChapters ? 1 : n,
+        assets: ['mara vell', 'Lantern', 'Nobody'], location: 'Kell Point',
+        time: 'Dusk', weather: '', action: 'Mara waits on the shale.',
+        emotion: '', camera: '', composition: '', lighting: '', style: '',
+        requiredReferences: ['mara vell'],
+      }));
       return {
         scenes: [
           {
             key: `ch${n}-the-lamp`, chapterNumber: state.misnumberChapters ? 1 : n,
-            assets: ['Mara Vell', 'The Lantern'], location: 'Kell Point',
+            assets: ['Mara Vell', 'The Lantern', 'Tin Cup'], location: 'Kell Point',
             time: 'Night', weather: 'Fog', action: 'Mara trims the lamp.',
             emotion: 'Wary', camera: 'Low three-quarter', composition: 'Off-centre',
             lighting: 'Single warm source', style: 'Muted ink wash',
             requiredReferences: ['Mara Vell'],
           },
+          ...extra,
         ],
       };
     },
@@ -188,13 +204,43 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
   },
   {
     match: 'You are Visual QA',
-    body: (user) => ({
-      sceneKey: sceneKeyFrom(user),
-      passed: true,
-      checks: [{ check: 'Keeper is grey-haired', result: 'pass', note: '' }],
-      criticalFailures: [],
-      recommendation: 'accept',
-    }),
+    body: (user) => {
+      const sceneKey = sceneKeyFrom(user);
+      if (state.failVisualQa > 0) {
+        state.failVisualQa--;
+        return {
+          sceneKey, passed: false,
+          checks: [{ check: 'Keeper has a burn scar', result: 'fail', note: 'No scar visible.' }],
+          criticalFailures: ['Keeper has no burn scar'],
+          recommendation: 'regenerate',
+        };
+      }
+      if (state.failCheckOnce) {
+        state.failCheckOnce = false;
+        return {
+          sceneKey, passed: false,
+          checks: [{ check: 'Lamp is brass', result: 'fail', note: 'Reads as bronze.' }],
+          criticalFailures: [],
+          recommendation: 'regenerate',
+        };
+      }
+      if (state.softRegenerateOnce) {
+        state.softRegenerateOnce = false;
+        return {
+          sceneKey, passed: false,
+          checks: [{ check: 'Lamp is brass', result: 'warn', note: 'Reads as bronze.' }],
+          criticalFailures: [],
+          recommendation: 'regenerate',
+        };
+      }
+      return {
+        sceneKey,
+        passed: true,
+        checks: [{ check: 'Keeper is grey-haired', result: 'pass', note: '' }],
+        criticalFailures: [],
+        recommendation: 'accept',
+      };
+    },
   },
   {
     match: 'You are an independent critic',
@@ -352,6 +398,17 @@ export const state = {
   inflateDiagnosis: 0,
   /** When true, the copy editor and scene composer write chapter 1's number on every chapter. */
   misnumberChapters: false,
+  /** Visual QA verdicts that fail the render on a canon violation before verdicts pass again. */
+  failVisualQa: 0,
+  /** The next Visual QA verdict fails a check without a canon violation, then passes again. */
+  failCheckOnce: false,
+  /** The next Visual QA verdict asks for a regeneration with only a warning, then passes again. */
+  softRegenerateOnce: false,
+  /** Image calls seen so far; `refuseImageAt` refuses the call with this 1-based index. */
+  imageCalls: 0,
+  refuseImageAt: 0,
+  /** Additional scenes the composer offers per chapter, with loosely spelt asset names. */
+  extraScenes: 0,
   /** When set, chat calls whose system prompt contains this text return JSON that fails every schema. */
   breakSchemaFor: '' as string,
   /**
@@ -408,6 +465,16 @@ export async function startFakeOpenAI(): Promise<FakeOpenAI> {
       res.setHeader('Content-Type', 'application/json');
 
       if (url.includes('/images/')) {
+        // A safety refusal is a 400 the client must not retry; the caller's
+        // job fails for a person to look at.
+        state.imageCalls += 1;
+        if (state.refuseImageAt > 0 && state.imageCalls === state.refuseImageAt) {
+          state.refuseImageAt = 0;
+          calls.push({ agent: 'image-refused' });
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: { message: 'Your request was rejected by the safety system (content_policy_violation).' } }));
+          return;
+        }
         if (state.failImagesOnce) {
           state.failImagesOnce = false;
           res.statusCode = 500;
@@ -433,7 +500,14 @@ export async function startFakeOpenAI(): Promise<FakeOpenAI> {
 
       const system = String(payload.messages?.find((m) => m.role === 'system')?.content ?? '');
       const userMessage = payload.messages?.find((m) => m.role === 'user')?.content;
-      const user = typeof userMessage === 'string' ? userMessage : JSON.stringify(userMessage ?? '');
+      // Vision calls send an array of parts; the text parts are what fixtures read.
+      const user = typeof userMessage === 'string'
+        ? userMessage
+        : Array.isArray(userMessage)
+          ? userMessage
+              .map((part: { type?: string; text?: string }) => (part.type === 'text' ? String(part.text ?? '') : ''))
+              .join('\n')
+          : JSON.stringify(userMessage ?? '');
 
       const fixture = FIXTURES.find((f) => system.includes(f.match));
 

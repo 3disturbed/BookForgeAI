@@ -14,6 +14,7 @@ import { addUsage, EMPTY_USAGE, hasSpend, type UsageRecord } from '../domain/cos
 import {
   assemblePageModel, manuscriptDigest, pageDigest, type ChapterLike,
 } from '../domain/page-model.js';
+import { capScenes, mapAssetNames, normaliseSceneAssets, type NamedAsset } from '../domain/scenes.js';
 import {
   asUntrustedData, EMPTY_TOKEN_USAGE, emptyImageSink, generateImage, generateStructured,
   type ImageSink, type TokenUsage,
@@ -239,6 +240,69 @@ function findScene(projectId: string, sceneKey: string): SceneLike | null {
   return locateScene(projectId, sceneKey)?.scene ?? null;
 }
 
+/** The live registry, most important first, as the name mapper wants it. */
+function registryAssets(projectId: string): NamedAsset[] {
+  const rank: Record<string, number> = { primary: 0, secondary: 1 };
+  return repo
+    .listVisualAssets(projectId)
+    .filter((a) => a.status !== 'retired')
+    .sort((a, b) => (rank[a.importance] ?? 2) - (rank[b.importance] ?? 2))
+    .map((a) => ({ name: a.name, importance: a.importance }));
+}
+
+/**
+ * The reference sheet Visual QA judges identity against: the first required
+ * reference that has a sheet, else the most important scene asset with one.
+ * Background props never qualify, and a missing sheet attaches nothing rather
+ * than another asset's.
+ */
+async function referenceSheetFor(
+  projectId: string,
+  scene: SceneLike | null,
+): Promise<{ assetName: string; png: Buffer } | null> {
+  if (!scene) return null;
+  const rank: Record<string, number> = { primary: 0, secondary: 1 };
+  const rows = repo.listVisualAssets(projectId).filter((a) => a.status !== 'retired');
+  const bySlug = new Map(rows.map((a) => [slug(a.name), a]));
+  const inScene = new Set((scene.assets ?? []).map((n) => slug(n)));
+  const ordered = [
+    ...(scene.requiredReferences ?? []).map((n) => bySlug.get(slug(n))),
+    ...rows
+      .filter((a) => inScene.has(slug(a.name)))
+      .sort((a, b) => (rank[a.importance] ?? 2) - (rank[b.importance] ?? 2)),
+  ].filter((a): a is repo.VisualAssetRow => a !== undefined && (rank[a.importance] ?? 2) < 2);
+  for (const asset of ordered) {
+    const key = asset.referenceImageKeys[0];
+    if (!key) continue;
+    try {
+      return { assetName: asset.name, png: await getBlob(key) };
+    } catch {
+      // A sheet that cannot be read is not fatal; QA judges from the bible.
+    }
+  }
+  return null;
+}
+
+/**
+ * Registry entries for a scene's assets that have no reference package, keyed
+ * by the packages' artifact scopes (the registry's spelling), not by the name
+ * the designer echoed into them. Background props get none, by design.
+ */
+function canonForUnpackaged(
+  projectId: string,
+  scene: SceneLike | null,
+  packagedScopes: readonly string[],
+): { name: string; type: string; importance: string; canonicalDescription: Record<string, unknown> }[] {
+  const packaged = new Set(packagedScopes);
+  const wanted = new Set((scene?.assets ?? []).map((a) => slug(a)).filter((k) => !packaged.has(k)));
+  return repo
+    .listVisualAssets(projectId)
+    .filter((a) => wanted.has(slug(a.name)))
+    .map((a) => ({
+      name: a.name, type: a.type, importance: a.importance, canonicalDescription: a.canonicalDescription,
+    }));
+}
+
 export function allScenes(projectId: string): SceneLike[] {
   return repo
     .latestArtifactsOfKind<{ scenes: SceneLike[] }>(projectId, 'scene_spec')
@@ -248,9 +312,12 @@ export function allScenes(projectId: string): SceneLike[] {
 /** Approved reference art for the named assets, as image inputs. */
 async function referenceImagesFor(projectId: string, assetNames: string[]): Promise<Buffer[]> {
   const wanted = new Set(assetNames.map((n) => n.toLowerCase()));
+  const rank: Record<string, number> = { primary: 0, secondary: 1 };
   const assets = repo
     .listVisualAssets(projectId)
-    .filter((a) => wanted.has(a.name.toLowerCase()) && a.status !== 'retired');
+    .filter((a) => wanted.has(a.name.toLowerCase()) && a.status !== 'retired')
+    // Only four references are sent; the canon that matters most goes first.
+    .sort((a, b) => (rank[a.importance] ?? 2) - (rank[b.importance] ?? 2));
 
   const buffers: Buffer[] = [];
   for (const asset of assets) {
@@ -559,12 +626,21 @@ export async function executeAgent(
       const scope = job.scopeKey ?? '';
       // Choosing moments needs to know which assets exist and how much they
       // matter; the director restates their canon when the prompt is written.
-      return reason([
+      const maxScenes = env().MAX_SCENES_PER_CHAPTER;
+      const outcome = await reason([
         asUntrustedData('chapter', currentChapter(project.id, scope) ?? {}),
         asUntrustedData('asset_registry', assetRegistryDigest(readSingle(project.id, 'asset_registry'))),
         asUntrustedData('design_spec', requireSingle(project.id, 'design_spec')),
         asUntrustedData('chapter_scope', scope),
-      ]);
+      // The model is asked for exactly what the cap keeps, so no scene is
+      // written and billed only to be discarded.
+      ], { system: renderPrompt(prompt.body, { maxScenes: String(maxScenes) }) });
+      // Asset names are mapped onto the registry's spellings (a scene that says
+      // "Toast" means "Toast (Warhound)") so the reference art is attached, and
+      // the chapter keeps its first MAX_SCENES_PER_CHAPTER scenes: each one is
+      // a director call, a render and a QA call.
+      outcome.data = capScenes(normaliseSceneAssets(outcome.data, registryAssets(project.id)), maxScenes);
+      return outcome;
     }
 
     case 'image-director': {
@@ -572,16 +648,28 @@ export async function executeAgent(
       const scene = findScene(project.id, sceneKey);
       if (!scene) throw new BookForgeError('MISSING_INPUT', `Scene "${sceneKey}" not found`, 409);
 
-      const packages = repo
+      const packageRows = repo
         .latestArtifactsOfKind<ReferencePackageLike>(project.id, 'reference_package')
-        .filter((p) => scene.assets?.some((a) => slug(a) === p.scopeKey))
-        .map((p) => packageForScenes(p.data));
+        .filter((p) => scene.assets?.some((a) => slug(a) === p.scopeKey));
+      const packagedScopes = packageRows.map((p) => p.scopeKey ?? '');
 
-      return reason([
+      const outcome = await reason([
         asUntrustedData('scene', scene),
-        asUntrustedData('reference_packages', packages),
+        asUntrustedData('reference_packages', packageRows.map((p) => packageForScenes(p.data))),
+        // Assets with no package (background props) still have a canon to state.
+        asUntrustedData('asset_canon', canonForUnpackaged(project.id, scene, packagedScopes)),
         asUntrustedData('design_spec', requireSingle(project.id, 'design_spec')),
       ]);
+      // The director's spellings are mapped like the composer's: a near miss
+      // would otherwise render with no reference at all.
+      const spec = outcome.data as { referenceAssetNames?: unknown };
+      if (Array.isArray(spec.referenceAssetNames)) {
+        outcome.data = {
+          ...spec,
+          referenceAssetNames: mapAssetNames(spec.referenceAssetNames, registryAssets(project.id)),
+        };
+      }
+      return outcome;
     }
 
     case 'image-generator': {
@@ -595,16 +683,29 @@ export async function executeAgent(
       if (!spec) throw new BookForgeError('MISSING_INPUT', `No image spec for "${sceneKey}"`, 409);
 
       const scene = findScene(project.id, sceneKey);
-      const references = await referenceImagesFor(
-        project.id,
-        spec.data.referenceAssetNames?.length ? spec.data.referenceAssetNames : (scene?.assets ?? []),
-      );
+      const wanted = spec.data.referenceAssetNames?.length ? spec.data.referenceAssetNames : (scene?.assets ?? []);
+      const references = await referenceImagesFor(project.id, wanted);
+
+      // A regeneration is steered by what QA failed the last render for; it is
+      // not the same roll of the dice.
+      const verdict = job.round > 0
+        ? repo.latestArtifact<{
+            criticalFailures?: string[];
+            checks?: { check: string; result: string; note?: string }[];
+          }>(project.id, 'visual_qa_result', sceneKey)?.data
+        : undefined;
+      const steering = verdict
+        ? [
+            ...(verdict.criticalFailures ?? []),
+            ...(verdict.checks ?? []).filter((c) => c.result === 'fail').map((c) => c.note || c.check),
+          ]
+        : [];
 
       // The job's own tier is image, so its spend accumulates on the job's
       // image sink and survives a failure after the render.
       const sink = spent?.image ?? emptyImageSink();
       const image = await generateImage({
-        prompt: [spec.data.prompt, negativeClause([spec.data.negativePrompt])]
+        prompt: [spec.data.prompt, negativeClause([spec.data.negativePrompt, ...steering])]
           .filter(Boolean)
           .join(' '),
         aspectRatio: spec.data.aspectRatio,
@@ -632,12 +733,18 @@ export async function executeAgent(
         usage: ledgerFromImages(sink, 1, image.referenceCount),
         // A silent fallback is how the canon stopped reaching a render without
         // anyone knowing; it is recorded so Visual QA and the ledger can see it.
-        afterCommit: image.referenceFallback
+        // So is a render that named references and found no sheet for any.
+        afterCommit: image.referenceFallback || (wanted.length > 0 && references.length === 0)
           ? () => repo.recordEvent({
               projectId: project.id,
               type: 'ILLUSTRATION_GENERATED',
               actor: 'system',
-              payload: { sceneKey, referenceFallback: true, referencesOffered: references.length },
+              payload: {
+                sceneKey,
+                referenceFallback: image.referenceFallback,
+                referencesWanted: wanted.length,
+                referencesOffered: references.length,
+              },
             })
           : undefined,
       };
@@ -645,26 +752,34 @@ export async function executeAgent(
 
     case 'visual-qa': {
       const sceneKey = job.scopeKey ?? '';
-      const artwork = repo.latestArtifact<{ storageKey: string }>(project.id, 'artwork', sceneKey);
+      const artwork = repo.latestArtifact<{ storageKey: string; revision: number }>(
+        project.id, 'artwork', sceneKey,
+      );
       const spec = repo.latestArtifact(project.id, 'image_spec', sceneKey);
       if (!artwork || !spec) {
         throw new BookForgeError('MISSING_INPUT', `No artwork to QA for "${sceneKey}"`, 409);
       }
 
       const scene = findScene(project.id, sceneKey);
-      const packages = repo
+      const packageRows = repo
         .latestArtifactsOfKind<ReferencePackageLike>(project.id, 'reference_package')
-        .filter((p) => scene?.assets?.some((a) => slug(a) === p.scopeKey))
-        .map((p) => packageForScenes(p.data));
+        .filter((p) => scene?.assets?.some((a) => slug(a) === p.scopeKey));
+      const packagedScopes = packageRows.map((p) => p.scopeKey ?? '');
 
-      const images = [await getBlob(artwork.data.storageKey)];
+      // The render first, then the reference sheet it is judged against, named
+      // in the context, so identity is compared with the canon and not with
+      // its description alone.
+      const sheet = await referenceSheetFor(project.id, scene);
+      const images = [await getBlob(artwork.data.storageKey), ...(sheet ? [sheet.png] : [])];
       const result = await generateStructured({
         capability: def.capability,
         system: prompt.body,
         user: [
           asUntrustedData('image_spec', spec.data),
           asUntrustedData('scene', scene ?? {}),
-          asUntrustedData('reference_packages', packages),
+          asUntrustedData('reference_packages', packageRows.map((p) => packageForScenes(p.data))),
+          asUntrustedData('reference_sheet_for', sheet?.assetName ?? ''),
+          asUntrustedData('asset_canon', canonForUnpackaged(project.id, scene, packagedScopes)),
         ].join('\n\n'),
         schema: outputSchema,
         images,
@@ -674,7 +789,14 @@ export async function executeAgent(
       // The render it inspects is billed inside this call's prompt tokens, so
       // it is not also counted as an image input.
       return {
-        data: result.data,
+        // The verdict is about the job's scene, whatever key the model echoed,
+        // and names the render it judged, so a regeneration is judged afresh
+        // rather than inheriting the old render's verdict.
+        data: passVerdict({
+          ...(result.data as Record<string, unknown>),
+          sceneKey,
+          artworkRevision: artwork.data.revision,
+        }),
         model: result.model,
         promptVersion: prompt.version,
         capability: def.capability,
@@ -841,6 +963,17 @@ function normaliseArtifact(
     0,
   );
   return { ...chapter, wordCount };
+}
+
+/**
+ * A verdict passes when nothing failed: no critical failure and no check marked
+ * `fail`. Derived rather than trusted, so the gate that redoes a render and the
+ * gate that publishes the book cannot disagree about it.
+ */
+function passVerdict(data: Record<string, unknown>): Record<string, unknown> {
+  const critical = Array.isArray(data.criticalFailures) ? data.criticalFailures.length : 0;
+  const checks = Array.isArray(data.checks) ? (data.checks as { result?: unknown }[]) : [];
+  return { ...data, passed: critical === 0 && !checks.some((c) => c?.result === 'fail') };
 }
 
 type TaskSeverity = 'critical' | 'major' | 'minor';
@@ -1038,6 +1171,6 @@ function isRetryable(error: unknown): boolean {
 
 /** Exposed for unit tests only. */
 export const __testing = {
-  normaliseArtifact, clampTaskSeverity,
+  normaliseArtifact, clampTaskSeverity, passVerdict,
   bookSpine, outlineNeighbours, assetRegistryDigest, registryForProse, canonicalNamesDigest, packageForScenes,
 };

@@ -421,12 +421,17 @@ async function editWithReferences(
     return { b64, fellBack: false };
   } catch (error) {
     if (error instanceof BookForgeError) throw error;
-    // Not every configured image model accepts image inputs. The rejected edit
-    // is counted as a call that produced nothing and billed no tokens; the
-    // fresh render that follows is the one image delivered. The fallback is
-    // reported because it means the canon references never reached the model.
+    // The rejected edit is counted as a call that produced nothing and billed
+    // no tokens either way.
     absorbImage(local, { ...EMPTY_IMAGE_USAGE }, (Date.now() - started) / 1000);
     absorbImage(sink, { ...EMPTY_IMAGE_USAGE }, (Date.now() - started) / 1000);
+    // A safety refusal is about the prompt, not the image inputs: rendering
+    // again without them would only be refused again, at a second call's cost.
+    const refusal = asRefusal(error);
+    if (refusal) throw refusal;
+    // Not every configured image model accepts image inputs. The fresh render
+    // that follows is the one image delivered. The fallback is reported because
+    // it means the canon references never reached the model.
     const fresh = await generateFresh(model, prompt, size, local, sink);
     return { ...fresh, fellBack: true };
   }
