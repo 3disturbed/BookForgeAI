@@ -5,6 +5,7 @@ import { env } from '../domain/env.js';
 import { BookForgeError, ContentRefusedError } from '../domain/errors.js';
 import { slug } from '../domain/ids.js';
 import { schemaFor } from '../domain/schemas.js';
+import { stripEmDashesDeep } from '../domain/typography.js';
 import { storageKey } from '../domain/storage-paths.js';
 import type { UsageRecord } from '../domain/costs.js';
 import { asUntrustedData, generateImage, generateStructured } from '../ai/openai.js';
@@ -536,10 +537,14 @@ const CHAPTER_KINDS: ReadonlySet<string> = new Set([
  * it is recomputed from the committed text.
  */
 function normaliseArtifact(kind: string, data: unknown): unknown {
-  if (!CHAPTER_KINDS.has(kind) || typeof data !== 'object' || data === null) return data;
+  // House style is enforced on every artifact, not just prose: headings,
+  // captions, blurbs and notes all reach the finished PDF.
+  const value = stripEmDashesDeep(data);
 
-  const chapter = data as { blocks?: { text?: string }[]; wordCount?: number };
-  if (!Array.isArray(chapter.blocks)) return data;
+  if (!CHAPTER_KINDS.has(kind) || typeof value !== 'object' || value === null) return value;
+
+  const chapter = value as { blocks?: { text?: string }[]; wordCount?: number };
+  if (!Array.isArray(chapter.blocks)) return value;
 
   const wordCount = chapter.blocks.reduce(
     (total, block) => total + (String(block?.text ?? '').match(/\S+/g)?.length ?? 0),
