@@ -124,15 +124,38 @@ export async function executeAgent(
   const prompt = loadPrompt(def.promptId);
   const outputSchema = schemaFor(def.writes) as unknown as z.ZodType<unknown>;
 
+  /**
+   * The author's answers travel with every agent. Attaching them here rather
+   * than to each agent's read list means a new agent cannot forget to honour a
+   * decision the author already made.
+   */
+  const decisions = repo.latestArtifact<{
+    answers: { question: string; answer: string; delegated: boolean }[];
+  }>(project.id, 'decisions');
+
+  const answered = (decisions?.data.answers ?? []).filter((a) => !a.delegated && a.answer.trim());
+
   /** Shared path: assemble context, reason, validate, return. */
   const reason = async (contextParts: string[], overrides?: {
     system?: string;
     schema?: z.ZodType<unknown>;
   }): Promise<Outcome> => {
+    const parts = answered.length
+      ? [...contextParts, asUntrustedData('author_decisions', answered)]
+      : contextParts;
+
+    const system = [
+      overrides?.system ?? prompt.body,
+      answered.length
+        ? '\nThe author has already decided the questions in <author_decisions>. ' +
+          'Follow those decisions exactly. Do not reopen them or choose otherwise.'
+        : '',
+    ].join('');
+
     const result = await generateStructured({
       capability: def.capability,
-      system: overrides?.system ?? prompt.body,
-      user: contextParts.join('\n\n'),
+      system,
+      user: parts.join('\n\n'),
       schema: overrides?.schema ?? outputSchema,
     });
     return {

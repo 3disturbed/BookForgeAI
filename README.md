@@ -107,6 +107,14 @@ artifacts. Canonical facts live in structured project data, never in hidden
 conversational memory. An edition pins exact artifact versions, so its PDF is
 reproducible.
 
+**Answering the agents' questions.** Discover ends its brief with the decisions
+it could not make from the idea: how pointed a critique should be, which runic
+row to reference, how much practical detail a craft section needs. Those
+questions are put to the author at the brief gate, and the answers travel with
+every later agent, which is told to follow them and not reopen them. A question
+the author would rather not settle can be delegated explicitly, so the agents
+decide it on the record instead of by default.
+
 **Human approval gates.** Eight gates — brief, architecture, visual canon,
 outline, manuscript, key illustrations, final PDF, publication payment — hold the
 pipeline until a person approves. Approving the visual canon locks its assets; a

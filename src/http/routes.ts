@@ -14,6 +14,7 @@ import { advanceProject, applyApproval, workerStatus } from '../queue/orchestrat
 import { blobExists, blobExistsSync, signedUrlFor } from '../storage/blobs.js';
 import * as repo from '../store/repo.js';
 import { issueSession, clearSession, currentUserId, ownedProject, requireUser, userIdOf } from './auth.js';
+import { validateAnswers } from './decisions.js';
 
 export const api = Router();
 
@@ -141,6 +142,101 @@ api.post('/projects/:id/approvals', (req: Request, res: Response) => {
 
   res.json(snapshot(req, project.id));
 });
+
+/* ---------------------------- decisions ---------------------------- */
+
+/**
+ * The Discover agent raises questions it wants a human to settle. Approving the
+ * brief without answering them lets every later agent invent its own answer, so
+ * they are surfaced at the gate and recorded here.
+ */
+api.get('/projects/:id/decisions', (req: Request, res: Response) => {
+  const project = ownedProject(req, param(req, 'id'));
+  res.json(openQuestionsFor(project.id));
+});
+
+api.post('/projects/:id/decisions', (req: Request, res: Response) => {
+  const project = ownedProject(req, param(req, 'id'));
+
+  const body = z
+    .object({
+      answers: z
+        .array(
+          z.object({
+            question: z.string().min(1).max(2000),
+            answer: z.string().max(4000).default(''),
+            delegated: z.boolean().default(false),
+          }),
+        )
+        .min(1),
+    })
+    .safeParse(req.body);
+
+  if (!body.success) throw new BadRequestError('Provide answers to record');
+
+  // Answers are matched to questions by exact text. An answer to a question the
+  // brief never asked would be stored and then silently ignored, so reject it
+  // rather than let a typo look like a saved decision.
+  validateAnswers(
+    repo.latestArtifact<{ openQuestions?: string[] }>(project.id, 'brief')?.data.openQuestions ?? [],
+    body.data.answers,
+  );
+
+  const now = new Date().toISOString();
+  // Merge onto what is already recorded so answering one at a time works.
+  const existing = repo.latestArtifact<{ answers: AnswerRow[] }>(project.id, 'decisions');
+  const merged = new Map<string, AnswerRow>(
+    (existing?.data.answers ?? []).map((a) => [a.question, a]),
+  );
+  for (const a of body.data.answers) {
+    merged.set(a.question, { ...a, answeredAt: now });
+  }
+
+  repo.writeArtifact({
+    projectId: project.id,
+    kind: 'decisions',
+    data: { answers: [...merged.values()] },
+    producedByJobId: null,
+  });
+
+  repo.recordEvent({
+    projectId: project.id,
+    type: 'BRIEF_CREATED',
+    actor: userIdOf(req),
+    payload: { decisions: body.data.answers.length },
+  });
+
+  advanceProject(project.id);
+  res.json(openQuestionsFor(project.id));
+});
+
+interface AnswerRow {
+  question: string;
+  answer: string;
+  delegated: boolean;
+  answeredAt: string;
+}
+
+function openQuestionsFor(projectId: string) {
+  const brief = repo.latestArtifact<{ openQuestions?: string[] }>(projectId, 'brief');
+  const decisions = repo.latestArtifact<{ answers: AnswerRow[] }>(projectId, 'decisions');
+  const byQuestion = new Map((decisions?.data.answers ?? []).map((a) => [a.question, a]));
+
+  const questions = (brief?.data.openQuestions ?? []).map((question) => {
+    const recorded = byQuestion.get(question);
+    return {
+      question,
+      answer: recorded?.answer ?? '',
+      delegated: recorded?.delegated ?? false,
+      answered: Boolean(recorded && (recorded.delegated || recorded.answer.trim())),
+    };
+  });
+
+  return {
+    questions,
+    unanswered: questions.filter((q) => !q.answered).length,
+  };
+}
 
 /* ---------------------------- artifacts ---------------------------- */
 
@@ -386,6 +482,7 @@ function snapshot(req: Request, projectId: string) {
     jobCounts: repo.countJobs(projectId),
     acceptance: acceptanceFor(projectId),
     brief: repo.latestArtifact(projectId, 'brief')?.data ?? null,
+    decisions: openQuestionsFor(projectId),
     design: repo.latestArtifact(projectId, 'design_spec')?.data ?? null,
     architecture: repo.latestArtifact(projectId, 'architecture')?.data ?? null,
     outline: repo.latestArtifact(projectId, 'outline')?.data ?? null,

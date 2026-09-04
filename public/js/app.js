@@ -241,6 +241,7 @@ function renderPipeline() {
   const done = stages.filter((s) => s.state === 'complete' || s.state === 'degraded').length;
 
   return el('div', {},
+    renderOpenQuestions(),
     !state.config.openaiConfigured &&
       el('div', { class: 'notice warn' },
         'OPENAI_API_KEY is not set, so agent jobs will fail. Add it to .env and restart the service.'),
@@ -286,6 +287,9 @@ function renderStage(stage) {
     ),
     el('div', { class: 'row' },
       stage.gate && approvals[stage.gate] === true && el('span', { class: 'tag ok' }, 'approved'),
+      needsApproval && stage.gate === 'brief' && state.current.decisions?.unanswered > 0 &&
+        el('span', { class: 'tag warn' },
+          `${state.current.decisions.unanswered} question(s) unanswered`),
       needsApproval && el('button', {
         class: 'small primary',
         onclick: () => approve(stage.gate, true),
@@ -306,6 +310,99 @@ async function approve(gate, approved) {
   });
   state.cache = {};
   render();
+}
+
+/* -------------------------- open questions -------------------------- */
+
+/**
+ * The Discover agent raises decisions it wants the author to make. Left
+ * unanswered, every later agent invents its own answer, so they are put in
+ * front of the author at the gate rather than buried in the brief.
+ */
+function renderOpenQuestions() {
+  const decisions = state.current.decisions;
+  if (!decisions || decisions.questions.length === 0) return null;
+  if (decisions.unanswered === 0 && !state.showAnswered) {
+    return el('div', { class: 'notice ok' },
+      `All ${decisions.questions.length} open questions answered. `,
+      el('button', {
+        class: 'small ghost',
+        onclick: () => { state.showAnswered = true; render(); },
+      }, 'Review'));
+  }
+
+  const draft = {};
+
+  return el('div', { class: 'card', style: 'border-color:var(--warn)' },
+    el('h2', {}, 'The book needs your decisions'),
+    el('p', { class: 'muted' },
+      `Discover raised ${decisions.questions.length} question` +
+      `${decisions.questions.length === 1 ? '' : 's'} it cannot answer from your idea. ` +
+      'Whatever you answer here is passed to every later agent and followed exactly. ' +
+      'Anything you leave to BookForgeAI is decided by the agents.'),
+
+    decisions.questions.map((q, i) =>
+      el('div', { style: 'padding:12px 0;border-bottom:1px solid var(--line)' },
+        el('div', { class: 'row', style: 'align-items:flex-start;gap:8px' },
+          el('span', { class: `tag ${q.answered ? 'ok' : 'warn'}` },
+            q.delegated ? 'delegated' : q.answered ? 'answered' : 'open'),
+          el('b', { style: 'font-weight:500;flex:1;min-width:0' }, q.question)),
+        el('textarea', {
+          id: `q-${i}`,
+          rows: 2,
+          style: 'margin-top:8px',
+          placeholder: q.delegated ? 'Left to BookForgeAI' : 'Your answer…',
+          oninput: (e) => { draft[q.question] = e.target.value; },
+        }, q.answer),
+        el('div', { class: 'row', style: 'margin-top:6px' },
+          el('button', {
+            class: 'small primary',
+            onclick: () => saveDecision(q.question, draft[q.question] ?? q.answer, false),
+          }, 'Save answer'),
+          el('button', {
+            class: 'small ghost',
+            onclick: () => saveDecision(q.question, '', true),
+          }, 'Leave to BookForgeAI')),
+      )),
+
+    el('div', { class: 'row', style: 'margin-top:14px' },
+      el('button', {
+        class: 'primary',
+        onclick: () => {
+          const answers = decisions.questions.map((q) => ({
+            question: q.question,
+            answer: draft[q.question] ?? q.answer,
+            delegated: !(draft[q.question] ?? q.answer).trim(),
+          }));
+          saveDecisions(answers);
+        },
+      }, 'Save all'),
+      el('button', {
+        class: 'ghost',
+        onclick: () => saveDecisions(decisions.questions.map((q) => ({
+          question: q.question, answer: '', delegated: true,
+        }))),
+      }, 'Leave all to BookForgeAI'),
+      decisions.unanswered > 0 &&
+        el('span', { class: 'tag warn' }, `${decisions.unanswered} unanswered`)),
+  );
+}
+
+async function saveDecision(question, answer, delegated) {
+  await saveDecisions([{ question, answer, delegated }]);
+}
+
+async function saveDecisions(answers) {
+  try {
+    await api(`/projects/${state.current.project.id}/decisions`, {
+      method: 'POST', body: { answers },
+    });
+    state.current = await api(`/projects/${state.current.project.id}`);
+    state.cache = {};
+    render();
+  } catch (error) {
+    alert(error.message);
+  }
 }
 
 /* ------------------------------ brief ------------------------------- */

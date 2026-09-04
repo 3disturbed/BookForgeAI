@@ -67,6 +67,24 @@ export const BriefSchema = z.object({
   openQuestions: z.array(z.string()).default([]),
 });
 
+/**
+ * The author's answers to questions the agents raised. Every later agent reads
+ * this, so a decision made once is honoured everywhere instead of each agent
+ * quietly inventing its own.
+ */
+export const DecisionsSchema = z.object({
+  answers: z.array(
+    z.object({
+      question: z.string().min(1),
+      /** Empty when the author explicitly delegated the choice. */
+      answer: z.string().default(''),
+      /** True when the author read the question and handed it back. */
+      delegated: z.boolean().default(false),
+      answeredAt: z.string().default(''),
+    }),
+  ).default([]),
+});
+
 export const ResearchSourceSchema = z.object({
   title: z.string(),
   kind: z.enum(['fact', 'reference', 'inspiration', 'constraint']),
@@ -364,6 +382,7 @@ export const EditionSchema = z.object({
 
 export const ARTIFACT_SCHEMAS = {
   brief: BriefSchema,
+  decisions: DecisionsSchema,
   research_library: ResearchLibrarySchema,
   knowledge_map: KnowledgeMapSchema,
   asset_registry: AssetRegistrySchema,

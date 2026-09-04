@@ -4,6 +4,8 @@
  */
 export const ARTIFACT_KINDS = [
   'brief',
+  // Written by the author, not an agent: answers to the questions agents raised.
+  'decisions',
   'research_library',
   'knowledge_map',
   'asset_registry',

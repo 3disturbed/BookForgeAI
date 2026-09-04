@@ -280,3 +280,67 @@ test('signed file links are scoped and expire', async () => {
   assert.throws(() => blobs.signedUrlFor(key, 'proj-b'), /Not authorized/);
   assert.throws(() => blobs.signedUrlFor('../../etc/passwd', 'proj-a'), /Not authorized/);
 });
+
+test('author decisions are recorded and reach every agent', async () => {
+  const user = repo.upsertUser('decisions@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Decisions', idea: 'A book with choices to make.',
+  });
+
+  // Run Discover so a brief with open questions exists.
+  orchestrator.advanceProject(project.id);
+  const discover = repo.claimNextJob(project.id)!;
+  await runner.runJob(discover);
+
+  const brief = repo.latestArtifact<{ openQuestions: string[] }>(project.id, 'brief')!;
+  assert.ok(brief.data.openQuestions.length > 0, 'Discover raised questions');
+
+  const question = brief.data.openQuestions[0]!;
+  repo.writeArtifact({
+    projectId: project.id,
+    kind: 'decisions',
+    data: {
+      answers: [
+        { question, answer: 'Yes, the sea is sentient.', delegated: false, answeredAt: 'now' },
+        { question: 'ignored', answer: '', delegated: true, answeredAt: 'now' },
+      ],
+    },
+    producedByJobId: null,
+  });
+
+  // The brief gate holds the pipeline until a human approves, so clear it.
+  orchestrator.applyApproval({
+    projectId: project.id, gate: 'brief', approved: true, actor: 'test',
+  });
+
+  // The next agent must receive the answered decision, and not the delegated one.
+  orchestrator.advanceProject(project.id);
+  const research = repo.claimNextJob(project.id);
+  assert.ok(research, 'the brief gate released the next stage');
+  await runner.runJob(research);
+
+  const seen = fake.lastUserMessage;
+  assert.ok(seen.includes('author_decisions'), 'decisions were attached to the agent call');
+  assert.ok(seen.includes('Yes, the sea is sentient.'), 'the answer was passed through');
+  assert.ok(!seen.includes('"question": "ignored"'), 'delegated questions are not passed');
+});
+
+test('an answer to a question the brief never asked is rejected', async () => {
+  const user = repo.upsertUser('unknown-q@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Unknown', idea: 'A book with a short question list.',
+  });
+
+  orchestrator.advanceProject(project.id);
+  await runner.runJob(repo.claimNextJob(project.id)!);
+
+  const { validateAnswers } = await import('../http/decisions.js');
+  const asked = repo.latestArtifact<{ openQuestions: string[] }>(project.id, 'brief')!
+    .data.openQuestions;
+
+  assert.doesNotThrow(() => validateAnswers(asked, [{ question: asked[0]! }]));
+  assert.throws(
+    () => validateAnswers(asked, [{ question: 'a question from a different book' }]),
+    /No such open question/,
+  );
+});

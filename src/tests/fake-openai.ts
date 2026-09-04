@@ -303,10 +303,13 @@ export interface FakeOpenAI {
   url: string;
   close: () => Promise<void>;
   calls: { agent: string }[];
+  /** The user content of the most recent chat call, for asserting context. */
+  lastUserMessage: string;
 }
 
 export async function startFakeOpenAI(): Promise<FakeOpenAI> {
   const calls: { agent: string }[] = [];
+  let handle: FakeOpenAI;
 
   const server: Server = createServer((req, res) => {
     let raw = '';
@@ -337,6 +340,7 @@ export async function startFakeOpenAI(): Promise<FakeOpenAI> {
       }
 
       calls.push({ agent: fixture.match });
+      handle.lastUserMessage = user;
       res.end(JSON.stringify({
         id: 'chatcmpl-fake',
         choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify(fixture.body(user)) }, finish_reason: 'stop' }],
@@ -349,9 +353,12 @@ export async function startFakeOpenAI(): Promise<FakeOpenAI> {
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : 0;
 
-  return {
+  handle = {
     url: `http://127.0.0.1:${port}/v1`,
     calls,
+    lastUserMessage: '',
     close: () => new Promise<void>((closed) => server.close(() => closed())),
   };
+
+  return handle;
 }
