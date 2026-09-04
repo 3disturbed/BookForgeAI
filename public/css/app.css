@@ -210,3 +210,12 @@ dialog::backdrop { background: rgba(0,0,0,.65); }
 .empty { text-align: center; padding: 50px 20px; color: var(--ink-faint); }
 .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ------------------------------ costs ------------------------------ */
+
+table.costs { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+.costs th, .costs td { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; }
+.costs th { font-weight: 500; color: var(--ink-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.costs .num { text-align: right; font-family: var(--mono); }
+.costs .bad { color: var(--err); }
+.costs tr.has-failed td:first-child { border-left: 2px solid var(--err); }

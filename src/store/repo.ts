@@ -4,7 +4,7 @@ import type { ArtifactKind } from '../domain/artifacts.js';
 import type { CoreEvent } from '../domain/events.js';
 import type { StageId } from '../domain/pipeline.js';
 import type { ApprovalGate, AssetStatus, AssetType, JobStatus, ProjectStatus, PublicationState } from '../domain/states.js';
-import type { UsageRecord } from '../domain/costs.js';
+import type { UsageLine, UsageRecord } from '../domain/costs.js';
 import { EMPTY_USAGE } from '../domain/costs.js';
 import { applyCorrections, applyCorrectionsDeep, type TermCorrection } from '../domain/terms.js';
 
@@ -811,44 +811,118 @@ export function getEdition(id: string): EditionRow | null {
 
 /* ----------------------------- usage ------------------------------ */
 
+/**
+ * One ledger row per attempt that spent money. Failed attempts are recorded
+ * with status 'failed' so burnt retries are visible rather than free, and
+ * every row says which agent, tier, model and mode produced it so a mixed
+ * fleet can be priced per tier.
+ */
 export function recordUsage(input: {
   projectId: string;
   jobId: string | null;
+  agent?: string | null;
+  capability?: string | null;
+  provider?: string;
+  model?: string | null;
+  mode?: 'sync' | 'batch';
+  status?: 'completed' | 'failed';
   usage: Partial<UsageRecord>;
 }): void {
+  const u = input.usage;
   database().prepare(
     `INSERT INTO usage_ledger
-       (id, project_id, job_id, text_input_tokens, text_output_tokens,
-        image_generations, image_input_images, compute_seconds, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, project_id, job_id, agent, capability, provider, model, mode, status,
+        text_input_tokens, cached_input_tokens, text_output_tokens, reasoning_tokens, model_calls,
+        image_generations, image_calls, image_input_images,
+        image_input_tokens, image_text_input_tokens, image_output_tokens,
+        batched_input_tokens, batched_output_tokens,
+        compute_seconds, model_latency_seconds, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     newId(), input.projectId, input.jobId,
-    input.usage.textInputTokens ?? 0, input.usage.textOutputTokens ?? 0,
-    input.usage.imageGenerations ?? 0, input.usage.imageInputImages ?? 0,
-    input.usage.computeSeconds ?? 0, nowIso(),
+    input.agent ?? null, input.capability ?? null, input.provider ?? 'openai',
+    input.model ?? null, input.mode ?? 'sync', input.status ?? 'completed',
+    u.textInputTokens ?? 0, u.cachedInputTokens ?? 0, u.textOutputTokens ?? 0,
+    u.reasoningTokens ?? 0, u.modelCalls ?? 0,
+    u.imageGenerations ?? 0, u.imageCalls ?? 0, u.imageInputImages ?? 0,
+    u.imageInputTokens ?? 0, u.imageTextInputTokens ?? 0, u.imageOutputTokens ?? 0,
+    u.batchedInputTokens ?? 0, u.batchedOutputTokens ?? 0,
+    u.computeSeconds ?? 0, u.modelLatencySeconds ?? 0, nowIso(),
   );
 }
 
-export function totalUsage(projectId: string): UsageRecord {
-  const r = database().prepare(
-    `SELECT
-       COALESCE(SUM(text_input_tokens), 0)  AS ti,
-       COALESCE(SUM(text_output_tokens), 0) AS to_,
-       COALESCE(SUM(image_generations), 0)  AS ig,
-       COALESCE(SUM(image_input_images), 0) AS ii,
-       COALESCE(SUM(compute_seconds), 0)    AS cs
-     FROM usage_ledger WHERE project_id = ?`,
-  ).get(projectId) as Record<string, unknown> | undefined;
+const USAGE_SUMS = `
+  COALESCE(SUM(text_input_tokens), 0)      AS ti,
+  COALESCE(SUM(cached_input_tokens), 0)    AS ci,
+  COALESCE(SUM(text_output_tokens), 0)     AS to_,
+  COALESCE(SUM(reasoning_tokens), 0)       AS rt,
+  COALESCE(SUM(model_calls), 0)            AS mc,
+  COALESCE(SUM(image_generations), 0)      AS ig,
+  COALESCE(SUM(image_calls), 0)            AS ic,
+  COALESCE(SUM(image_input_images), 0)     AS ii,
+  COALESCE(SUM(image_input_tokens), 0)     AS iit,
+  COALESCE(SUM(image_text_input_tokens), 0) AS itt,
+  COALESCE(SUM(image_output_tokens), 0)    AS iot,
+  COALESCE(SUM(batched_input_tokens), 0)   AS bi,
+  COALESCE(SUM(batched_output_tokens), 0)  AS bo,
+  COALESCE(SUM(compute_seconds), 0)        AS cs,
+  COALESCE(SUM(model_latency_seconds), 0)  AS ml`;
 
-  if (!r) return { ...EMPTY_USAGE };
+function usageFromRow(r: Record<string, unknown>): UsageRecord {
   return {
     textInputTokens: Number(r.ti ?? 0),
+    cachedInputTokens: Number(r.ci ?? 0),
     textOutputTokens: Number(r.to_ ?? 0),
+    reasoningTokens: Number(r.rt ?? 0),
+    modelCalls: Number(r.mc ?? 0),
     imageGenerations: Number(r.ig ?? 0),
+    imageCalls: Number(r.ic ?? 0),
     imageInputImages: Number(r.ii ?? 0),
+    imageInputTokens: Number(r.iit ?? 0),
+    imageTextInputTokens: Number(r.itt ?? 0),
+    imageOutputTokens: Number(r.iot ?? 0),
+    batchedInputTokens: Number(r.bi ?? 0),
+    batchedOutputTokens: Number(r.bo ?? 0),
     storageGbMonths: 0,
     computeSeconds: Number(r.cs ?? 0),
+    modelLatencySeconds: Number(r.ml ?? 0),
   };
+}
+
+export function totalUsage(projectId: string): UsageRecord {
+  const r = database()
+    .prepare(`SELECT ${USAGE_SUMS} FROM usage_ledger WHERE project_id = ?`)
+    .get(projectId) as Record<string, unknown> | undefined;
+  return r ? usageFromRow(r) : { ...EMPTY_USAGE };
+}
+
+/**
+ * Spend by agent, tier, model and mode — the view that prices a mixed fleet
+ * and shows where a book's money went. Failed attempts are included in the
+ * sums and counted separately.
+ */
+export function usageBreakdown(projectId: string): UsageLine[] {
+  const rows = database()
+    .prepare(
+      `SELECT agent, capability, model, mode,
+         COUNT(*) AS calls,
+         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+         ${USAGE_SUMS}
+       FROM usage_ledger WHERE project_id = ?
+       GROUP BY agent, capability, model, mode
+       ORDER BY (ti + to_) DESC`,
+    )
+    .all(projectId) as Record<string, unknown>[];
+
+  return rows.map((r) => ({
+    ...usageFromRow(r),
+    agent: (r.agent as string | null) ?? 'unattributed',
+    capability: (r.capability as string | null) ?? null,
+    model: (r.model as string | null) ?? null,
+    mode: (r.mode as 'sync' | 'batch') ?? 'sync',
+    calls: Number(r.calls ?? 0),
+    failedCalls: Number(r.failed ?? 0),
+  }));
 }
 
 /**

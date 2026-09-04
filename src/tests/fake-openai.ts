@@ -297,7 +297,41 @@ function sceneKeyFrom(user: string): string {
 }
 
 /** Mutable stub state, so a test can steer the pipeline down a branch. */
-export const state = { demandRewrites: 0 };
+export const state = {
+  demandRewrites: 0,
+  /** When set, chat calls whose system prompt contains this text return JSON that fails every schema. */
+  breakSchemaFor: '' as string,
+  /**
+   * While `remaining` is positive, chat calls whose system prompt contains
+   * `match` fail with a 500. The SDK retries 5xx on its own, so a test that
+   * wants the error to surface sets `remaining` above the SDK's retry count.
+   */
+  failChatFor: { match: '', skip: 0, remaining: 0 } as {
+    match: string;
+    /** Matching calls to let through normally before the outage begins. */
+    skip: number;
+    remaining: number;
+  },
+  /** When true, /images/edits is rejected with a 400 so the client falls back to a fresh render. */
+  rejectImageEdits: false,
+  /** When true, the next image call fails with a 500, then clears. */
+  failImagesOnce: false,
+};
+
+/** Every billable detail the real API reports, so the ledger tests can see them. */
+export const CHAT_USAGE = {
+  prompt_tokens: 400,
+  completion_tokens: 250,
+  total_tokens: 650,
+  prompt_tokens_details: { cached_tokens: 120 },
+  completion_tokens_details: { reasoning_tokens: 40 },
+};
+
+export const IMAGE_USAGE = {
+  input_tokens: 30,
+  output_tokens: 1000,
+  input_tokens_details: { image_tokens: 20, text_tokens: 10 },
+};
 
 export interface FakeOpenAI {
   url: string;
@@ -319,8 +353,22 @@ export async function startFakeOpenAI(): Promise<FakeOpenAI> {
       res.setHeader('Content-Type', 'application/json');
 
       if (url.includes('/images/')) {
+        if (state.failImagesOnce) {
+          state.failImagesOnce = false;
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: { message: 'simulated image outage' } }));
+          return;
+        }
+        // A model that takes no image inputs rejects the edit; the client must
+        // fall back to a fresh render and report that it did.
+        if (state.rejectImageEdits && url.includes('/images/edits')) {
+          calls.push({ agent: 'image-edit-rejected' });
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: { message: 'This model does not support image inputs' } }));
+          return;
+        }
         calls.push({ agent: 'image' });
-        res.end(JSON.stringify({ data: [{ b64_json: PNG_1X1 }] }));
+        res.end(JSON.stringify({ data: [{ b64_json: PNG_1X1 }], usage: IMAGE_USAGE }));
         return;
       }
 
@@ -333,6 +381,35 @@ export async function startFakeOpenAI(): Promise<FakeOpenAI> {
       const user = typeof userMessage === 'string' ? userMessage : JSON.stringify(userMessage ?? '');
 
       const fixture = FIXTURES.find((f) => system.includes(f.match));
+
+      // A transport failure on a specific agent's call, for tests of what a
+      // job keeps when a later attempt dies.
+      if (state.failChatFor.match && system.includes(state.failChatFor.match) &&
+          state.failChatFor.skip > 0) {
+        // Let the first `skip` matching calls through, so an attempt can be
+        // billed before the outage begins.
+        state.failChatFor.skip -= 1;
+      } else if (state.failChatFor.remaining > 0 && state.failChatFor.match &&
+          system.includes(state.failChatFor.match)) {
+        state.failChatFor.remaining -= 1;
+        calls.push({ agent: `outage:${fixture?.match ?? '?'}` });
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: { message: 'simulated outage' } }));
+        return;
+      }
+
+      // Valid JSON that satisfies no artifact schema, so the caller's repair
+      // loop runs and then fails — the path a burnt retry's spend travels.
+      if (state.breakSchemaFor && system.includes(state.breakSchemaFor)) {
+        calls.push({ agent: `broken:${fixture?.match ?? '?'}` });
+        handle.lastUserMessage = user;
+        res.end(JSON.stringify({
+          id: 'chatcmpl-fake',
+          choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify({ unexpected: true }) }, finish_reason: 'stop' }],
+          usage: CHAT_USAGE,
+        }));
+        return;
+      }
       if (!fixture) {
         res.statusCode = 400;
         res.end(JSON.stringify({ error: { message: `No fixture for prompt: ${system.slice(0, 90)}` } }));
@@ -344,7 +421,7 @@ export async function startFakeOpenAI(): Promise<FakeOpenAI> {
       res.end(JSON.stringify({
         id: 'chatcmpl-fake',
         choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify(fixture.body(user)) }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 400, completion_tokens: 250, total_tokens: 650 },
+        usage: CHAT_USAGE,
       }));
     });
   });

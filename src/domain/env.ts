@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { CostRates } from './costs.js';
 
 /**
  * Runtime configuration (config/example.env).
@@ -70,9 +71,54 @@ const EnvSchema = z.object({
     .enum(['true', 'false'])
     .default('true')
     .transform((v) => v === 'true'),
+
+  /**
+   * Unit prices, USD per million tokens unless stated. Copied by the operator
+   * from the vendor's pricing page for the models actually configured. All
+   * default to zero so an unconfigured install reports payment fees only.
+   */
+  RATE_TEXT_INPUT_PER_M: z.coerce.number().min(0).default(0),
+  RATE_TEXT_CACHED_INPUT_PER_M: z.coerce.number().min(0).default(0),
+  RATE_TEXT_OUTPUT_PER_M: z.coerce.number().min(0).default(0),
+  RATE_LIGHT_INPUT_PER_M: z.coerce.number().min(0).default(0),
+  RATE_LIGHT_CACHED_INPUT_PER_M: z.coerce.number().min(0).default(0),
+  RATE_LIGHT_OUTPUT_PER_M: z.coerce.number().min(0).default(0),
+  RATE_IMAGE_INPUT_PER_M: z.coerce.number().min(0).default(0),
+  /** Text-prompt input to the image model; zero falls back to RATE_IMAGE_INPUT_PER_M. */
+  RATE_IMAGE_TEXT_INPUT_PER_M: z.coerce.number().min(0).default(0),
+  RATE_IMAGE_OUTPUT_PER_M: z.coerce.number().min(0).default(0),
+  /** Flat per-image fallback for models that report no image tokens. */
+  RATE_PER_IMAGE: z.coerce.number().min(0).default(0),
+  /** Multiplier for tokens sent through the Batch API; 1 until measured. */
+  RATE_BATCH_MULTIPLIER: z.coerce.number().min(0).max(1).default(1),
+  RATE_STORAGE_PER_GB_MONTH: z.coerce.number().min(0).default(0),
+  RATE_COMPUTE_PER_HOUR: z.coerce.number().min(0).default(0),
+  RATE_PAYMENT_PERCENT: z.coerce.number().min(0).max(1).default(0.029),
+  RATE_PAYMENT_FIXED: z.coerce.number().min(0).default(0.3),
 });
 
 export type Env = z.infer<typeof EnvSchema>;
+
+/** The operator's price list, from RATE_* variables. */
+export function ratesFromEnv(config: Env = env()): CostRates {
+  return {
+    textInputPerMillionTokens: config.RATE_TEXT_INPUT_PER_M,
+    textCachedInputPerMillionTokens: config.RATE_TEXT_CACHED_INPUT_PER_M,
+    textOutputPerMillionTokens: config.RATE_TEXT_OUTPUT_PER_M,
+    lightInputPerMillionTokens: config.RATE_LIGHT_INPUT_PER_M,
+    lightCachedInputPerMillionTokens: config.RATE_LIGHT_CACHED_INPUT_PER_M,
+    lightOutputPerMillionTokens: config.RATE_LIGHT_OUTPUT_PER_M,
+    imageInputPerMillionTokens: config.RATE_IMAGE_INPUT_PER_M,
+    imageTextInputPerMillionTokens: config.RATE_IMAGE_TEXT_INPUT_PER_M,
+    imageOutputPerMillionTokens: config.RATE_IMAGE_OUTPUT_PER_M,
+    perImageGeneration: config.RATE_PER_IMAGE,
+    batchMultiplier: config.RATE_BATCH_MULTIPLIER,
+    storagePerGbMonth: config.RATE_STORAGE_PER_GB_MONTH,
+    computePerHour: config.RATE_COMPUTE_PER_HOUR,
+    paymentPercent: config.RATE_PAYMENT_PERCENT,
+    paymentFixed: config.RATE_PAYMENT_FIXED,
+  };
+}
 
 let cached: Env | null = null;
 

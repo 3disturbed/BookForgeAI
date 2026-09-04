@@ -2,8 +2,8 @@ import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { evaluateAcceptance } from '../domain/acceptance.js';
 import { AGENTS, type AgentName } from '../domain/agents.js';
-import { computeMargin, DEFAULT_RATES } from '../domain/costs.js';
-import { env, isOpenAiConfigured, isStripeConfigured } from '../domain/env.js';
+import { marginFromLines, priceLine } from '../domain/costs.js';
+import { env, isOpenAiConfigured, isStripeConfigured, ratesFromEnv } from '../domain/env.js';
 import { BadRequestError, BookForgeError, NotFoundError, PreconditionError } from '../domain/errors.js';
 import { slug } from '../domain/ids.js';
 import { ORDERED_STAGES, STAGE_IDS, STAGES } from '../domain/pipeline.js';
@@ -327,6 +327,10 @@ api.post('/projects/:id/assets/:assetId/regenerate', async (req: Request, res: R
   const project = ownedProject(req, param(req, 'id'));
   const asset = repo.getVisualAsset(param(req, 'assetId'));
   if (!asset || asset.projectId !== project.id) throw new NotFoundError('visual asset');
+  // The manual path honours the same kill switch as the pipeline's image steps.
+  if (!env().ENABLE_ILLUSTRATIONS) {
+    throw new PreconditionError('Illustrations are disabled (ENABLE_ILLUSTRATIONS=false)');
+  }
 
   const body = z
     .object({
@@ -380,8 +384,20 @@ api.post('/projects/:id/assets/:assetId/regenerate', async (req: Request, res: R
   });
 
   repo.recordUsage({
-    projectId: project.id, jobId: null,
-    usage: { imageGenerations: 1, imageInputImages: image.referenceCount },
+    projectId: project.id,
+    jobId: null,
+    agent: 'asset-regenerate',
+    capability: 'image',
+    model: image.model,
+    usage: {
+      imageGenerations: 1,
+      imageCalls: image.imageCalls,
+      imageInputImages: image.referenceCount,
+      imageInputTokens: image.usage.imageInputTokens,
+      imageTextInputTokens: image.usage.imageTextInputTokens,
+      imageOutputTokens: image.usage.imageOutputTokens,
+      modelLatencySeconds: image.latencySeconds,
+    },
   });
 
   res.json({
@@ -389,6 +405,25 @@ api.post('/projects/:id/assets/:assetId/regenerate', async (req: Request, res: R
     url: signedUrlFor(key, project.id).url,
     prompt,
     negativePrompts: negatives,
+  });
+});
+
+/* ------------------------------ usage ------------------------------ */
+
+/**
+ * Where a book's money went: one line per agent, tier, model and mode, with
+ * failed attempts counted rather than hidden. Rates come from RATE_* and the
+ * response says whether any have been entered, so zeros are never mistaken
+ * for free.
+ */
+api.get('/projects/:id/usage', (req: Request, res: Response) => {
+  const project = ownedProject(req, param(req, 'id'));
+  const lines = repo.usageBreakdown(project.id);
+  const rates = ratesFromEnv();
+  res.json({
+    lines: lines.map((line) => ({ ...line, cost: priceLine(line, rates) })),
+    total: repo.totalUsage(project.id),
+    economics: marginFromLines(lines, rates, env().BOOK_PUBLISHING_PRICE_USD),
   });
 });
 
@@ -663,7 +698,11 @@ function snapshot(req: Request, projectId: string) {
     proof: repo.latestArtifact(projectId, 'pdf_proof_report')?.data ?? null,
     edition: project.editionId ? repo.getEdition(project.editionId) : null,
     usage,
-    economics: computeMargin(usage, DEFAULT_RATES, env().BOOK_PUBLISHING_PRICE_USD),
+    // Priced per ledger line so a gpt-5 / mini mix and batched tokens are each
+    // billed at their own rate; an aggregate cannot say which model did what.
+    economics: marginFromLines(
+      repo.usageBreakdown(projectId), ratesFromEnv(), env().BOOK_PUBLISHING_PRICE_USD,
+    ),
     recentJobs: jobs.slice(0, 20).map((j) => ({
       id: j.id, stage: j.stage, agent: j.agent, persona: j.persona,
       scopeKey: j.scopeKey, status: j.status, model: j.model,

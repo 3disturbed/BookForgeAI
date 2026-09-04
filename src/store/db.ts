@@ -163,16 +163,35 @@ function migrate(conn: DatabaseSync): void {
       created_at TEXT NOT NULL
     );
 
+    -- One row per attempt that spent money, successful or not. Columns after
+    -- created_at were added later and are also listed in ADDED_COLUMNS so an
+    -- existing database receives them.
     CREATE TABLE IF NOT EXISTS usage_ledger (
-      id                 TEXT PRIMARY KEY,
-      project_id         TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-      job_id             TEXT,
-      text_input_tokens  INTEGER NOT NULL DEFAULT 0,
-      text_output_tokens INTEGER NOT NULL DEFAULT 0,
-      image_generations  INTEGER NOT NULL DEFAULT 0,
-      image_input_images INTEGER NOT NULL DEFAULT 0,
-      compute_seconds    REAL    NOT NULL DEFAULT 0,
-      created_at         TEXT NOT NULL
+      id                    TEXT PRIMARY KEY,
+      project_id            TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      job_id                TEXT,
+      text_input_tokens     INTEGER NOT NULL DEFAULT 0,
+      text_output_tokens    INTEGER NOT NULL DEFAULT 0,
+      image_generations     INTEGER NOT NULL DEFAULT 0,
+      image_input_images    INTEGER NOT NULL DEFAULT 0,
+      compute_seconds       REAL    NOT NULL DEFAULT 0,
+      created_at            TEXT NOT NULL,
+      agent                 TEXT,
+      capability            TEXT,
+      provider              TEXT NOT NULL DEFAULT 'openai',
+      model                 TEXT,
+      mode                  TEXT NOT NULL DEFAULT 'sync',
+      status                TEXT NOT NULL DEFAULT 'completed',
+      cached_input_tokens   INTEGER NOT NULL DEFAULT 0,
+      reasoning_tokens      INTEGER NOT NULL DEFAULT 0,
+      model_calls           INTEGER NOT NULL DEFAULT 0,
+      image_input_tokens    INTEGER NOT NULL DEFAULT 0,
+      image_text_input_tokens INTEGER NOT NULL DEFAULT 0,
+      image_output_tokens   INTEGER NOT NULL DEFAULT 0,
+      image_calls           INTEGER NOT NULL DEFAULT 0,
+      batched_input_tokens  INTEGER NOT NULL DEFAULT 0,
+      batched_output_tokens INTEGER NOT NULL DEFAULT 0,
+      model_latency_seconds REAL    NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_usage_project ON usage_ledger(project_id);
   `);
@@ -188,9 +207,27 @@ function migrate(conn: DatabaseSync): void {
 const ADDED_COLUMNS: { table: string; column: string; definition: string }[] = [
   { table: 'agent_jobs', column: 'round', definition: 'INTEGER NOT NULL DEFAULT 0' },
   { table: 'agent_jobs', column: 'retry_after', definition: 'TEXT' },
+  // Cost attribution: who spent it, on what, how, and whether it bought anything.
+  { table: 'usage_ledger', column: 'agent', definition: 'TEXT' },
+  { table: 'usage_ledger', column: 'capability', definition: 'TEXT' },
+  { table: 'usage_ledger', column: 'provider', definition: "TEXT NOT NULL DEFAULT 'openai'" },
+  { table: 'usage_ledger', column: 'model', definition: 'TEXT' },
+  { table: 'usage_ledger', column: 'mode', definition: "TEXT NOT NULL DEFAULT 'sync'" },
+  { table: 'usage_ledger', column: 'status', definition: "TEXT NOT NULL DEFAULT 'completed'" },
+  { table: 'usage_ledger', column: 'cached_input_tokens', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'usage_ledger', column: 'reasoning_tokens', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'usage_ledger', column: 'model_calls', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'usage_ledger', column: 'image_input_tokens', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'usage_ledger', column: 'image_text_input_tokens', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'usage_ledger', column: 'image_output_tokens', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'usage_ledger', column: 'image_calls', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'usage_ledger', column: 'batched_input_tokens', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'usage_ledger', column: 'batched_output_tokens', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'usage_ledger', column: 'model_latency_seconds', definition: 'REAL NOT NULL DEFAULT 0' },
 ];
 
-function applyColumnMigrations(conn: DatabaseSync): void {
+/** Exported so a test can prove an old database gains every listed column. */
+export function applyColumnMigrations(conn: DatabaseSync): void {
   for (const { table, column, definition } of ADDED_COLUMNS) {
     const existing = conn.prepare(`PRAGMA table_info(${table})`).all() as Record<string, unknown>[];
     if (existing.length === 0) continue; // table not created yet

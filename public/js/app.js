@@ -172,6 +172,7 @@ const TABS = [
   ['canon', 'Visual canon'],
   ['plates', 'Illustrations'],
   ['publish', 'Publish'],
+  ['costs', 'Costs'],
   ['jobs', 'Jobs'],
 ];
 
@@ -210,6 +211,7 @@ function renderTab() {
     case 'canon': return lazy('assets', renderCanon);
     case 'plates': return lazy('illustrations', renderPlates);
     case 'publish': return renderPublish();
+    case 'costs': return lazy('usage', renderCosts);
     case 'jobs': return renderJobs();
     default: return el('div');
   }
@@ -232,7 +234,7 @@ function lazy(resource, renderer) {
 }
 
 const tabForResource = (r) =>
-  ({ manuscript: 'manuscript', assets: 'canon', illustrations: 'plates' })[r];
+  ({ manuscript: 'manuscript', assets: 'canon', illustrations: 'plates', usage: 'costs' })[r];
 
 /* ----------------------------- pipeline ----------------------------- */
 
@@ -760,16 +762,19 @@ function renderPublish() {
         el('div', { class: 'stat' }, `$${economics.contributionMargin}`,
           el('small', {}, 'contribution'))),
       kv({
-        'Text tokens in': usage.textInputTokens.toLocaleString(),
-        'Text tokens out': usage.textOutputTokens.toLocaleString(),
+        'Text tokens in': `${usage.textInputTokens.toLocaleString()} (${usage.cachedInputTokens.toLocaleString()} cached)`,
+        'Text tokens out': `${usage.textOutputTokens.toLocaleString()} (${usage.reasoningTokens.toLocaleString()} reasoning)`,
+        'Model calls': usage.modelCalls,
         'Images generated': usage.imageGenerations,
         'Reference images used': usage.imageInputImages,
-        'Compute seconds': Math.round(usage.computeSeconds),
+        'Image tokens': (usage.imageInputTokens + usage.imageOutputTokens).toLocaleString(),
         'Payment fees': `$${economics.paymentFees}`,
       }),
-      el('p', { class: 'muted', style: 'font-size:11.5px;margin-top:10px' },
-        'Model and infrastructure rates default to zero until they are configured, ' +
-        'so cost here reflects payment fees only.')),
+      el('p', { class: economics.ratesConfigured ? 'muted' : 'notice warn', style: 'font-size:11.5px;margin-top:10px' },
+        economics.ratesConfigured
+          ? 'Priced per agent and tier from the RATE_* settings. The Costs tab has the breakdown.'
+          : 'No model rates are configured (RATE_* in .env), so model and image cost show as $0 ' +
+            'and only payment fees are real. The Costs tab shows the tokens regardless.')),
   );
 }
 
@@ -821,6 +826,65 @@ function renderJobs() {
             `${j.agent}${j.persona ? `:${j.persona}` : ''}${j.scopeKey ? ` [${j.scopeKey}]` : ''}` +
             `${j.error ? ` — ${j.error}` : ''}`),
           el('span', { class: 'muted' }, j.promptVersion ?? ''))))
+  );
+}
+
+/* ------------------------------- costs ------------------------------- */
+
+/**
+ * Where the money went: one row per agent, tier, model and mode. Failed
+ * attempts are in the sums and counted separately, because their spend was
+ * real. Costs are $0 until RATE_* is configured, and the page says so rather
+ * than letting a zero look like free.
+ */
+function renderCosts(data) {
+  const { lines, economics } = data;
+  const fmt = (n) => Number(n ?? 0).toLocaleString();
+  const money = (n) => `$${Number(n ?? 0).toFixed(2)}`;
+  const columns = [
+    'agent', 'tier', 'model', 'mode', 'calls', 'failed',
+    'input', 'cached', 'output', 'reasoning', 'images', 'img calls', 'image tokens', 'cost',
+  ];
+
+  return el('div', {},
+    !economics.ratesConfigured &&
+      el('div', { class: 'notice warn' },
+        'No model rates are configured, so every cost below is $0.00 and only payment fees are real. ' +
+        'Set RATE_* in .env from your vendor’s pricing page for the models you actually use.'),
+
+    el('div', { class: 'card' },
+      el('div', { class: 'row', style: 'gap:24px;margin-bottom:12px' },
+        el('div', { class: 'stat' }, money(economics.textCost), el('small', {}, 'text')),
+        el('div', { class: 'stat' }, money(economics.imageCost), el('small', {}, 'images')),
+        el('div', { class: 'stat' }, money(economics.paymentFees), el('small', {}, 'payment fees')),
+        el('div', { class: 'stat' }, money(economics.contributionMargin), el('small', {}, 'contribution'))),
+
+      lines.length === 0
+        ? el('p', { class: 'muted' }, 'Nothing has run yet.')
+        : el('div', { style: 'overflow-x:auto' },
+            el('table', { class: 'costs' },
+              el('thead', {}, el('tr', {}, columns.map((c) => el('th', {}, c)))),
+              el('tbody', {}, lines.map((l) =>
+                el('tr', { class: l.failedCalls > 0 ? 'has-failed' : '' },
+                  el('td', {}, l.agent),
+                  el('td', {}, l.capability ?? '–'),
+                  el('td', {}, l.model ?? '–'),
+                  el('td', {}, l.mode),
+                  el('td', { class: 'num' }, fmt(l.calls)),
+                  el('td', { class: `num${l.failedCalls > 0 ? ' bad' : ''}` }, fmt(l.failedCalls)),
+                  el('td', { class: 'num' }, fmt(l.textInputTokens)),
+                  el('td', { class: 'num' }, fmt(l.cachedInputTokens)),
+                  el('td', { class: 'num' }, fmt(l.textOutputTokens)),
+                  el('td', { class: 'num' }, fmt(l.reasoningTokens)),
+                  el('td', { class: 'num' }, fmt(l.imageGenerations)),
+                  el('td', { class: 'num' }, fmt(l.imageCalls)),
+                  el('td', { class: 'num' }, fmt(l.imageInputTokens + l.imageOutputTokens)),
+                  el('td', { class: 'num' }, money(l.cost.textCost + l.cost.imageCost))))))),
+
+      el('p', { class: 'muted', style: 'font-size:11.5px;margin-top:10px' },
+        'Cached input is priced at the cached rate and batched tokens at RATE_BATCH_MULTIPLIER. ' +
+        'Reasoning tokens are inside output and shown for visibility only. ' +
+        'Failed attempts are included: a burnt retry costs the same as a good one.')),
   );
 }
 

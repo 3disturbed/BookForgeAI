@@ -1,15 +1,20 @@
 import { z } from 'zod';
-import { agentDefinition, CRITIC_INPUTS, type AgentName } from '../domain/agents.js';
+import {
+  agentDefinition, CRITIC_INPUTS, type AgentDefinition, type AgentName,
+} from '../domain/agents.js';
 import type { ArtifactKind } from '../domain/artifacts.js';
-import { env } from '../domain/env.js';
+import { env, type ModelCapability } from '../domain/env.js';
 import { BookForgeError, ContentRefusedError } from '../domain/errors.js';
 import { slug } from '../domain/ids.js';
 import { schemaFor } from '../domain/schemas.js';
 import { stripEmDashesDeep } from '../domain/typography.js';
 import { applyCorrectionsDeep, deriveCorrections, type TermCorrection } from '../domain/terms.js';
 import { storageKey } from '../domain/storage-paths.js';
-import type { UsageRecord } from '../domain/costs.js';
-import { asUntrustedData, generateImage, generateStructured } from '../ai/openai.js';
+import { addUsage, EMPTY_USAGE, hasSpend, type UsageRecord } from '../domain/costs.js';
+import {
+  asUntrustedData, EMPTY_TOKEN_USAGE, emptyImageSink, generateImage, generateStructured,
+  type ImageSink, type TokenUsage,
+} from '../ai/openai.js';
 import { loadPrompt, renderPrompt } from '../ai/prompts.js';
 import { getBlob, putBlob } from '../storage/blobs.js';
 import { renderPdf, type PageModel } from '../pdf/render.js';
@@ -27,6 +32,58 @@ interface Outcome {
   afterCommit?: (artifactId: string) => void | Promise<void>;
   /** Canonical spellings to enforce on the written artifact. */
   corrections?: readonly TermCorrection[];
+  /** Price tier the reasoning call was billed on, for the ledger. */
+  capability?: ModelCapability;
+}
+
+interface LedgerExtra {
+  capability: ModelCapability;
+  model: string | null;
+  usage: Partial<UsageRecord>;
+}
+
+/** Maps a chat call's billed usage onto ledger fields. */
+function ledgerFromTokens(u: TokenUsage): Partial<UsageRecord> {
+  return {
+    textInputTokens: u.textInputTokens,
+    cachedInputTokens: u.cachedInputTokens,
+    textOutputTokens: u.textOutputTokens,
+    reasoningTokens: u.reasoningTokens,
+    modelCalls: u.modelCalls,
+    modelLatencySeconds: u.latencySeconds,
+  };
+}
+
+/**
+ * Everything a job has been billed so far, held outside the calls that incur
+ * it so no throw can lose it. The ledger is written from this on both the
+ * success and the failure path: a putBlob failure after a rendered image, or a
+ * transport error on a repair retry, still books what the vendor charged.
+ */
+export interface Spent {
+  /** Chat spend on the agent's own tier. */
+  text: TokenUsage;
+  /** Image spend when the agent's own tier is image (image-generator). */
+  image: ImageSink;
+  /** Spend on other tiers within the same job (asset-designer's reference render). */
+  extra: LedgerExtra[];
+}
+
+export const emptySpent = (): Spent => ({
+  text: { ...EMPTY_TOKEN_USAGE }, image: emptyImageSink(), extra: [],
+});
+
+/** Maps an image sink onto ledger fields; `delivered` is images actually produced. */
+function ledgerFromImages(sink: ImageSink, delivered: number, referenceCount = 0): Partial<UsageRecord> {
+  return {
+    imageGenerations: delivered,
+    imageCalls: sink.imageCalls,
+    imageInputImages: referenceCount,
+    imageInputTokens: sink.usage.imageInputTokens,
+    imageTextInputTokens: sink.usage.imageTextInputTokens,
+    imageOutputTokens: sink.usage.imageOutputTokens,
+    modelLatencySeconds: sink.latencySeconds,
+  };
 }
 
 /* --------------------------- read helpers -------------------------- */
@@ -121,6 +178,8 @@ async function referenceImagesFor(projectId: string, assetNames: string[]): Prom
 export async function executeAgent(
   project: repo.ProjectRow,
   job: repo.JobRow,
+  /** Accumulates spend as calls return; runJob reads it on failure. */
+  spent?: Spent,
 ): Promise<Outcome> {
   const name = job.agent as AgentName;
   const def = agentDefinition(name);
@@ -167,16 +226,15 @@ export async function executeAgent(
       system,
       user: parts.join('\n\n'),
       schema: overrides?.schema ?? outputSchema,
+      sink: spent?.text,
     });
     return {
       data: result.data,
       model: result.model,
       promptVersion: prompt.version,
       corrections,
-      usage: {
-        textInputTokens: result.usage.textInputTokens,
-        textOutputTokens: result.usage.textOutputTokens,
-      },
+      capability: def.capability,
+      usage: ledgerFromTokens(result.usage),
     };
   };
 
@@ -271,19 +329,30 @@ export async function executeAgent(
       // sheet is the anchor every later illustration of this asset is matched to.
       const pkg = outcome.data as { referencePrompts: string[]; negativePrompts: string[] };
       if (env().ENABLE_ILLUSTRATIONS && pkg.referencePrompts?.length) {
+        // The chat and the render are different price tiers, so the render is
+        // ledgered on its own line. It is registered in `spent` the moment the
+        // call returns: if storing the file fails afterwards, the vendor has
+        // still charged for the render and the ledger must say so.
+        const sink = emptyImageSink();
+        const extra: LedgerExtra = { capability: 'image', model: null, usage: {} };
+        spent?.extra.push(extra);
         try {
           const image = await generateImage({
             prompt: [pkg.referencePrompts[0], negativeClause(pkg.negativePrompts)]
               .filter(Boolean)
               .join(' '),
             aspectRatio: '1:1',
-          });
+          }, sink);
+          extra.model = image.model;
+          extra.usage = ledgerFromImages(sink, 1);
+
           const key = storageKey(project.id, 'assets', `${slug(asset.name)}-reference.png`);
           await putBlob(key, image.png);
           repo.addAssetReferenceImage(asset.id, key);
           repo.setAssetStatus(asset.id, 'review');
-          outcome.usage.imageGenerations = (outcome.usage.imageGenerations ?? 0) + 1;
         } catch (error) {
+          // Whatever the failed attempt was billed is kept.
+          extra.usage = ledgerFromImages(sink, 0);
           // The written bible is the artifact that matters; the reference sheet
           // is enrichment. Innocuous subjects do get refused — a carving knife
           // reads as a weapon — so losing the image must not lose the asset.
@@ -410,13 +479,16 @@ export async function executeAgent(
         spec.data.referenceAssetNames?.length ? spec.data.referenceAssetNames : (scene?.assets ?? []),
       );
 
+      // The job's own tier is image, so its spend accumulates on the job's
+      // image sink and survives a failure after the render.
+      const sink = spent?.image ?? emptyImageSink();
       const image = await generateImage({
         prompt: [spec.data.prompt, negativeClause([spec.data.negativePrompt])]
           .filter(Boolean)
           .join(' '),
         aspectRatio: spec.data.aspectRatio,
         references,
-      });
+      }, sink);
 
       const key = storageKey(project.id, 'illustrations', `${sceneKey}.png`);
       await putBlob(key, image.png);
@@ -433,7 +505,20 @@ export async function executeAgent(
         },
         model: image.model,
         promptVersion: prompt.version,
-        usage: { imageGenerations: 1, imageInputImages: image.referenceCount },
+        capability: 'image',
+        // One image was delivered however many calls it took; calls are
+        // counted separately so a fallback never bills as two images.
+        usage: ledgerFromImages(sink, 1, image.referenceCount),
+        // A silent fallback is how the canon stopped reaching a render without
+        // anyone knowing; it is recorded so Visual QA and the ledger can see it.
+        afterCommit: image.referenceFallback
+          ? () => repo.recordEvent({
+              projectId: project.id,
+              type: 'ILLUSTRATION_GENERATED',
+              actor: 'system',
+              payload: { sceneKey, referenceFallback: true, referencesOffered: references.length },
+            })
+          : undefined,
       };
     }
 
@@ -462,17 +547,17 @@ export async function executeAgent(
         ].join('\n\n'),
         schema: outputSchema,
         images,
+        sink: spent?.text,
       });
 
+      // The render it inspects is billed inside this call's prompt tokens, so
+      // it is not also counted as an image input.
       return {
         data: result.data,
         model: result.model,
         promptVersion: prompt.version,
-        usage: {
-          textInputTokens: result.usage.textInputTokens,
-          textOutputTokens: result.usage.textOutputTokens,
-          imageInputImages: images.length,
-        },
+        capability: def.capability,
+        usage: ledgerFromTokens(result.usage),
       };
     }
 
@@ -614,11 +699,23 @@ export async function runJob(job: repo.JobRow): Promise<void> {
     return;
   }
 
+  // An unknown agent name can never succeed. Fail the job rather than throw
+  // out of the worker and leave it 'running' with nothing behind it.
+  let def: AgentDefinition;
+  try {
+    def = agentDefinition(job.agent as AgentName);
+  } catch (error) {
+    repo.failJob(job.id, error instanceof Error ? error.message : String(error), false);
+    return;
+  }
+
   const startedAt = Date.now();
+  // Every call writes its bill here as it returns, so a throw anywhere after
+  // a billed call cannot lose the spend.
+  const spent = emptySpent();
 
   try {
-    const outcome = await executeAgent(project, job);
-    const def = agentDefinition(job.agent as AgentName);
+    const outcome = await executeAgent(project, job, spent);
 
     const artifact = repo.writeArtifact({
       projectId: project.id,
@@ -634,18 +731,76 @@ export async function runJob(job: repo.JobRow): Promise<void> {
       ...outcome.usage,
       computeSeconds: (Date.now() - startedAt) / 1000,
     };
+    // The job row carries the whole bill, other tiers included, so a per-job
+    // view does not understate an agent that both chatted and rendered.
+    const jobUsage = spent.extra.reduce(
+      (total, extra) => addUsage(total, extra.usage),
+      addUsage(EMPTY_USAGE, usage),
+    );
 
     repo.completeJob(job.id, {
       outputArtifactIds: [artifact.id],
       model: outcome.model,
       promptVersion: `${def.promptId}@${outcome.promptVersion}`,
+      usage: { ...jobUsage },
+    });
+    repo.recordUsage({
+      projectId: project.id,
+      jobId: job.id,
+      agent: job.agent,
+      capability: outcome.capability ?? def.capability,
+      model: outcome.model,
       usage,
     });
-    repo.recordUsage({ projectId: project.id, jobId: job.id, usage });
+    for (const extra of spent.extra) {
+      if (!hasSpend(extra.usage)) continue;
+      repo.recordUsage({
+        projectId: project.id,
+        jobId: job.id,
+        agent: job.agent,
+        capability: extra.capability,
+        model: extra.model,
+        usage: extra.usage,
+      });
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const retryable = isRetryable(error) && job.retryCount < env().AGENT_MAX_RETRIES;
     repo.failJob(job.id, message, retryable);
+
+    // Record exactly what was accumulated before the failure — the chat calls
+    // that returned, the render that was billed before storage failed — and
+    // nothing that was not. A failure before any call books no spend at all.
+    const model = error instanceof BookForgeError
+      ? ((error.details.model as string | undefined) ?? null)
+      : null;
+    const main: Partial<UsageRecord> = {
+      ...ledgerFromTokens(spent.text),
+      ...(def.capability === 'image' ? ledgerFromImages(spent.image, 0) : {}),
+    };
+    if (hasSpend(main)) {
+      repo.recordUsage({
+        projectId: project.id,
+        jobId: job.id,
+        agent: job.agent,
+        capability: def.capability,
+        model,
+        status: 'failed',
+        usage: { ...main, computeSeconds: (Date.now() - startedAt) / 1000 },
+      });
+    }
+    for (const extra of spent.extra) {
+      if (!hasSpend(extra.usage)) continue;
+      repo.recordUsage({
+        projectId: project.id,
+        jobId: job.id,
+        agent: job.agent,
+        capability: extra.capability,
+        model: extra.model,
+        status: 'failed',
+        usage: extra.usage,
+      });
+    }
   }
 }
 

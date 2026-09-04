@@ -164,6 +164,27 @@ test('a project runs the full pipeline and publishes', async () => {
   const usage = repo.totalUsage(project.id);
   assert.ok(usage.textOutputTokens > 0, 'text usage was recorded');
   assert.ok(usage.imageGenerations > 0, 'image usage was recorded');
+  assert.ok(usage.imageOutputTokens > 0, 'image tokens were read from the image response');
+  assert.ok(usage.cachedInputTokens > 0, 'cached input tokens reach the ledger');
+  const imageLine = repo.usageBreakdown(project.id).find((l) => l.agent === 'image-generator');
+  assert.ok(imageLine && imageLine.capability === 'image', 'image spend sits on the image tier');
+  const designerImage = repo.usageBreakdown(project.id)
+    .find((l) => l.agent === 'asset-designer' && l.capability === 'image');
+  assert.ok(designerImage, "asset-designer's reference render is ledgered on its own tier line");
+  // The line aggregates every asset-designer job, so "one sheet per job" is
+  // delivered images equalling ledger rows, not equalling one.
+  assert.equal(
+    designerImage.imageGenerations, designerImage.calls,
+    'one reference sheet delivered per asset job',
+  );
+  const qaLine = repo.usageBreakdown(project.id).find((l) => l.agent === 'visual-qa');
+  assert.ok(qaLine, 'visual-qa has a ledger line');
+  assert.equal(
+    qaLine.imageInputImages, 0,
+    'the inspected render is inside its prompt tokens, not counted again as an image input',
+  );
+  assert.ok(imageLine.imageGenerations >= 2 && imageLine.imageCalls >= imageLine.imageGenerations,
+    'delivered images and API calls are tracked separately');
 
   // Every job recorded its model and prompt version (SDD.md §9).
   const jobs = repo.listJobs(project.id, 500);
@@ -511,4 +532,130 @@ test('repairing a spelling does not erase the decision that defined it', async (
   const kept = repo.latestArtifact<{ answers: { question: string }[] }>(project.id, 'decisions')!;
   assert.equal(kept.data.answers[0]!.question, question, 'the decision record is untouched');
   assert.ok(deriveCorrections(kept.data.answers[0]!.question, 'Mapado').length > 0);
+});
+
+test('the ledger attributes spend to agent, tier and model, cached and reasoning tokens included', async () => {
+  const user = repo.upsertUser('ledger@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Ledger', idea: 'A book whose spend is attributed.',
+  });
+  orchestrator.advanceProject(project.id);
+  await runner.runJob(repo.claimNextJob(project.id)!);
+
+  const line = repo.usageBreakdown(project.id).find((l) => l.agent === 'discover');
+  assert.ok(line, 'discover has a ledger line');
+  assert.equal(line.capability, 'reasoning');
+  assert.equal(line.model, 'test-reasoning');
+  assert.equal(line.mode, 'sync');
+  assert.equal(line.calls, 1);
+  assert.equal(line.failedCalls, 0);
+  assert.equal(line.modelCalls, 1);
+  assert.equal(line.cachedInputTokens, 120, 'cached tokens are read from the usage details');
+  assert.equal(line.reasoningTokens, 40, 'reasoning tokens are read from the usage details');
+  assert.ok(line.modelLatencySeconds >= 0);
+});
+
+test('a failed attempt still records what it spent', async () => {
+  const user = repo.upsertUser('failed-spend@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Failed spend', idea: 'A book whose research fails validation.',
+  });
+  orchestrator.advanceProject(project.id);
+  await runner.runJob(repo.claimNextJob(project.id)!);
+  orchestrator.applyApproval({ projectId: project.id, gate: 'brief', approved: true, actor: 'test' });
+  orchestrator.advanceProject(project.id);
+
+  fakeState.breakSchemaFor = 'You are the Research agent';
+  try {
+    const job = repo.claimNextJob(project.id)!;
+    await runner.runJob(job);
+    assert.notEqual(repo.getJob(job.id)!.status, 'completed', 'the job did not complete');
+
+    const line = repo.usageBreakdown(project.id).find((l) => l.agent === 'research');
+    assert.ok(line, 'the failed attempt has a ledger line');
+    assert.equal(line.failedCalls, 1, 'and it is counted as failed');
+    assert.ok(line.textInputTokens > 0, 'its tokens were recorded rather than lost');
+    assert.equal(line.modelCalls, 2, 'the schema-repair retry was counted as a call');
+    assert.equal(line.model, 'test-reasoning');
+  } finally {
+    fakeState.breakSchemaFor = '';
+  }
+});
+
+test('a reference-image fallback is one delivered image, two calls, and is reported', async () => {
+  const { generateImage } = await import('../ai/openai.js');
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64',
+  );
+
+  fakeState.rejectImageEdits = true;
+  try {
+    const image = await generateImage({ prompt: 'a lantern', aspectRatio: '1:1', references: [png] });
+    assert.equal(image.referenceFallback, true, 'the fallback is reported');
+    assert.equal(image.imageCalls, 2, 'the rejected edit and the fresh render are both calls');
+    assert.equal(image.referenceCount, 0, 'no reference reached the model');
+    assert.equal(image.usage.imageOutputTokens, 1000, 'only the render that delivered was billed');
+  } finally {
+    fakeState.rejectImageEdits = false;
+  }
+});
+
+test('spend already billed survives a transport failure on a later attempt', async () => {
+  const user = repo.upsertUser('kept-spend@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Kept', idea: 'A book whose research call dies mid-repair.',
+  });
+  orchestrator.advanceProject(project.id);
+  await runner.runJob(repo.claimNextJob(project.id)!);
+  orchestrator.applyApproval({ projectId: project.id, gate: 'brief', approved: true, actor: 'test' });
+  orchestrator.advanceProject(project.id);
+
+  // Attempt 1 answers with JSON that fails the schema (billed). The repair
+  // attempt then hits an outage that outlasts the SDK's own retries.
+  fakeState.breakSchemaFor = 'You are the Research agent';
+  fakeState.failChatFor = { match: 'You are the Research agent', skip: 1, remaining: 6 };
+  try {
+    const job = repo.claimNextJob(project.id)!;
+    await runner.runJob(job);
+
+    const after = repo.getJob(job.id)!;
+    assert.equal(after.status, 'queued', 'a transport failure is retried');
+    assert.ok(after.retryAfter, 'behind a backoff');
+
+    const line = repo.usageBreakdown(project.id).find((l) => l.agent === 'research');
+    assert.ok(line, 'the failed attempt has a ledger line');
+    assert.equal(line.failedCalls, 1);
+    assert.equal(line.textInputTokens, 400, "attempt 1's tokens are kept although attempt 2 threw");
+    assert.equal(line.modelCalls, 2, 'both attempts are counted, the one that returned nothing included');
+  } finally {
+    fakeState.breakSchemaFor = '';
+    fakeState.failChatFor = { match: '', skip: 0, remaining: 0 };
+  }
+});
+
+test('a failure before any call books nothing rather than an invented call', async () => {
+  const user = repo.upsertUser('no-call@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'No call', idea: 'A book with a missing input.',
+  });
+  // An author job with no outline behind it fails on MISSING_INPUT before any model call.
+  const job = repo.enqueueJob({ projectId: project.id, stage: 'author', agent: 'author', scopeKey: 'ch9' });
+  await runner.runJob(repo.claimNextJob(project.id)!);
+
+  assert.equal(repo.getJob(job.id)!.status, 'failed');
+  assert.equal(repo.usageBreakdown(project.id).length, 0, 'no ledger line was fabricated');
+});
+
+test('an unknown agent name fails the job instead of stranding it', async () => {
+  const user = repo.upsertUser('unknown-agent@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Unknown agent', idea: 'A job for an agent that does not exist.',
+  });
+  const job = repo.enqueueJob({ projectId: project.id, stage: 'author', agent: 'no-such-agent' });
+  await runner.runJob(repo.claimNextJob(project.id)!);
+
+  const after = repo.getJob(job.id)!;
+  assert.equal(after.status, 'failed', 'it is failed, not left running');
+  assert.match(after.error ?? '', /Unknown agent/);
 });

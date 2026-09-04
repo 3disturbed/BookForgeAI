@@ -130,6 +130,16 @@ book's look is directed rather than accepted. A new sheet becomes the asset's
 primary reference, earlier ones are kept for comparison, the asset gains a
 version, and the canon gate reopens for approval.
 
+**Measuring cost.** Every attempt that spends money leaves a ledger line — agent,
+tier, model, mode, and everything the vendor bills differently: cached input,
+reasoning tokens (recorded inside output, never priced twice), image tokens,
+batched tokens, and the call count including schema-repair retries. Failed
+attempts are recorded too, so a burnt retry is never free in the books. Rates
+come from `RATE_*` in `.env`, copied from your vendor's pricing page for the
+models you actually run; they default to zero, and the console then reports
+payment fees only and says so rather than showing a cost that looks real and is
+not. `GET /projects/:id/usage` and the Costs tab give the per-agent breakdown.
+
 **Human approval gates.** Eight gates — brief, architecture, visual canon,
 outline, manuscript, key illustrations, final PDF, publication payment — hold the
 pipeline until a person approves. Approving the visual canon locks its assets; a
