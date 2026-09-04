@@ -7,3 +7,6 @@ build/
 coverage/
 *.log
 .DS_Store
+
+# Local data: SQLite database and blob storage
+data/

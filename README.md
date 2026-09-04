@@ -2,11 +2,51 @@
 
 **Idea → Forge → Review → Publish**
 
-BookForgeAI is an agentic book-production platform that turns a user's idea into a structured, illustrated, publication-ready book.
+BookForgeAI is an agentic book-production platform that turns a user's idea into a
+structured, illustrated, publication-ready book.
+
+This repository contains the design specification (`docs/`, `schemas/`) and a
+working Phase 1 MVP: a Node.js + TypeScript service that runs the full 22-agent
+pipeline against the OpenAI API and serves an HTML5 SaaS console.
+
+## Quick start
+
+```bash
+npm install
+cp config/example.env .env      # then set OPENAI_API_KEY
+npm run build
+npm start
+```
+
+Open <http://localhost:3000>, sign in with an email, and start a book.
+
+The MVP runs with **no external infrastructure**: SQLite on disk, blobs on the
+local filesystem, and an in-process job queue. Postgres, Redis and S3 are opt-in
+by setting their variables — the seams for the targets in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+Only `OPENAI_API_KEY` is required. Without Stripe keys the service uses a
+development checkout stand-in, which is refused when `NODE_ENV=production`.
+
+### Scripts
+
+| Command | Purpose |
+|---|---|
+| `npm run build` | Compile TypeScript to `dist/` |
+| `npm start` | Run the service |
+| `npm run dev` | Build, then run with `--watch` |
+| `npm test` | Build and run the full test suite |
+| `npm run typecheck` | Type-check without emitting |
 
 ## Core pipeline
 
-Discover → Research → Map → Visual Canon → Architect → Design → Outline → Author → Illustrate → Verify → Criticise → Diagnose → Rewrite → Edit → Layout → Proof → Publish
+Discover → Research → Map → Visual Canon → Architect → Design → Outline → Author
+→ Illustrate → Verify → Criticise → Diagnose → Rewrite → Edit → Layout → Proof →
+Publish
+
+The 18 stages and their dependencies live in
+[`src/domain/pipeline.ts`](src/domain/pipeline.ts); the 22 agents and their
+read/write contracts in [`src/domain/agents.ts`](src/domain/agents.ts).
 
 ## Core product
 
@@ -23,7 +63,14 @@ Discover → Research → Map → Visual Canon → Architect → Design → Outl
 
 ## AI
 
-Designed for OpenAI APIs. Text/reasoning and image models are configurable by environment variables. Illustration generation uses GPT-Image-2.
+Designed for OpenAI APIs. Text/reasoning and image models are configurable by
+environment variable. Illustration generation uses GPT-Image-2.
+
+Agents declare a **capability** (`text`, `reasoning`, `image`) and the model
+router resolves it from configuration — no model name is hard-coded in business
+logic. Every agent's output is parsed against a schema before it is committed as
+an artifact; output that fails validation is retried with the errors fed back,
+then rejected.
 
 ## Publishing
 
@@ -33,44 +80,91 @@ Default configuration:
 
 `BOOK_PUBLISHING_PRICE_USD=100`
 
-This is the BookForgeAI publishing charge, not a claim about underlying AI, printing, or payment-processing costs. Internal usage is metered separately for margin analysis.
+This is the BookForgeAI publishing charge, not a claim about underlying AI,
+printing, or payment-processing costs. Internal usage is metered separately for
+margin analysis.
 
-## MVP
+The checkout session is created server-side from configuration; a client-supplied
+amount is never trusted. In production, only a signature-verified Stripe webhook
+unlocks publication.
 
-1. Project creation
-2. Idea / Research / Map agents
-3. Visual Canon and asset reference generation
-4. Architecture / Design / Outline
-5. Chapter Author
-6. Image Director + GPT-Image-2
-7. Critic / Diagnosis / Rewrite loop
-8. Editing
-9. PDF layout and proofing
-10. $100 publishing checkout
-11. Final PDF delivery
+## How it works
+
+**Artifacts, not conversations.** Agents read and write versioned, immutable
+artifacts. Canonical facts live in structured project data, never in hidden
+conversational memory. An edition pins exact artifact versions, so its PDF is
+reproducible.
+
+**Human approval gates.** Eight gates — brief, architecture, visual canon,
+outline, manuscript, key illustrations, final PDF, publication payment — hold the
+pipeline until a person approves. Approving the visual canon locks its assets; a
+later change needs a new version and a fresh approval.
+
+**The revision loop.** Five independent critics (literary, structural, audience,
+factual, continuity) review every chapter. Diagnosis merges their findings into
+an ordered revision plan, the Rewriter applies it, and the critics read it again
+— bounded by `MAX_REVISION_CYCLES`. Exhausting the budget with critical issues
+still open escalates to a human rather than shipping silently.
+
+**Visual continuity.** Recurring characters, objects and locations get a
+canonical specification and approved reference art before ordinary illustration
+begins. Reference images are passed to the image model as inputs, and Visual QA
+checks every render against the canon. Consistency is probabilistic; the system
+reduces drift, it does not eliminate it.
+
+**The PDF.** Layout produces a structured page model — pages, blocks, images,
+captions — which a server-side renderer turns into a PDF. It is never generated
+from raw Markdown.
 
 ## Repository
 
 ```text
 BookForgeAI/
-├── README.md
-├── docs/
-│   ├── SDD.md
-│   ├── ARCHITECTURE.md
-│   ├── AGENTS.md
-│   ├── VISUAL_CANON.md
-│   ├── BOOK_PIPELINE.md
-│   ├── BILLING.md
-│   ├── PDF_PIPELINE.md
-│   ├── DATA_MODEL.md
-│   ├── SECURITY.md
-│   └── ROADMAP.md
-├── schemas/
-│   ├── book-project.schema.json
-│   ├── visual-asset.schema.json
-│   └── agent-job.schema.json
-├── config/example.env
-└── prompts/README.md
+├── src/
+│   ├── domain/      pipeline graph, agent registry, schemas, states, costs
+│   ├── agents/      the READ → REASON → VALIDATE → WRITE → REPORT runner
+│   ├── queue/       stage scheduler, revision loop, in-process worker
+│   ├── ai/          OpenAI client, model routing, prompt loader
+│   ├── store/       SQLite schema and repositories
+│   ├── storage/     blob storage with short-lived signed URLs
+│   ├── pdf/         page-model renderer
+│   ├── billing/     Stripe checkout and webhook verification
+│   ├── http/        REST API and session auth
+│   ├── tests/       unit tests and a full-pipeline integration test
+│   └── server.js    entry point
+├── public/          HTML5 SaaS console (no build step)
+├── prompts/         the prompt library, versioned independently of code
+├── schemas/         published JSON Schema contracts
+├── docs/            SDD, architecture, agents, pipeline, billing, security…
+└── config/example.env
 ```
 
-The Book Project—not the manuscript—is the source of truth. Canonical facts, characters, items, locations, timelines, style rules and approved artwork are structured and versioned.
+The Book Project—not the manuscript—is the source of truth. Canonical facts,
+characters, items, locations, timelines, style rules and approved artwork are
+structured and versioned.
+
+## Testing
+
+```bash
+npm test
+```
+
+The suite includes a full-pipeline integration test that runs all 22 agents, the
+approval gates, the revision loop, illustration generation, PDF rendering and the
+$100 publication flow against a stubbed model API — no network access or API key
+required.
+
+## Status
+
+Phase 1 (MVP) per [docs/ROADMAP.md](docs/ROADMAP.md) is implemented. Phases 2–4 —
+cover generation, EPUB/DOCX, version history, audiobooks, translation,
+collaboration, series continuity — are not.
+
+Known limits of the MVP:
+
+- The in-process queue and SQLite suit a single node. Redis/BullMQ and Postgres
+  are the documented path to scale out.
+- Research citations are model-supplied and unverified; treat `confidence: low`
+  sources accordingly.
+- Layout estimates page breaks from the model's page plan rather than measuring
+  rendered text, so long chapters can under-fill pages.

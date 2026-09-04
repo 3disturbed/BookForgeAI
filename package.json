@@ -1,0 +1,34 @@
+{
+  "name": "bookforgeai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agentic book-production service: idea to publication-ready illustrated PDF.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsc && node --watch dist/server.js",
+    "watch": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test \"dist/tests/*.test.js\"",
+    "test:only": "node --test \"dist/tests/*.test.js\""
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "openai": "^7.10.0",
+    "pdfkit": "^0.20.2",
+    "stripe": "^22.6.1",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.0.0",
+    "@types/pdfkit": "^0.17.0",
+    "typescript": "^5.9.0"
+  }
+}

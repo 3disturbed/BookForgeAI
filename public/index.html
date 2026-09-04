@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BookForgeAI</title>
+<meta name="description" content="Turn an idea into a structured, illustrated, publication-ready book.">
+<link rel="stylesheet" href="/css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#128214;</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <b>BookForge</b>AI
+    <small>Idea → Forge → Review → Publish</small>
+  </div>
+  <div class="spacer"></div>
+  <div class="who" id="who"></div>
+  <button class="small ghost" id="logout" hidden>Sign out</button>
+</header>
+
+<!-- Sign in ------------------------------------------------------- -->
+<section id="signin" class="empty" hidden>
+  <div class="card" style="max-width:400px;margin:60px auto;text-align:left">
+    <h1>Sign in</h1>
+    <p class="muted">Your projects are scoped to your account.</p>
+    <form id="signin-form">
+      <label>
+        <span>Email</span>
+        <input type="email" id="email" required placeholder="you@example.com" autocomplete="email">
+      </label>
+      <button class="primary" type="submit" style="width:100%">Continue</button>
+    </form>
+  </div>
+</section>
+
+<!-- App ----------------------------------------------------------- -->
+<div class="layout" id="app" hidden>
+  <aside class="sidebar">
+    <button class="primary" id="new-project" style="width:100%;margin-bottom:14px">New book</button>
+    <h3>Your books</h3>
+    <div id="project-list"></div>
+  </aside>
+
+  <main class="main" id="main">
+    <div class="empty">Select a book, or start a new one.</div>
+  </main>
+</div>
+
+<!-- New project --------------------------------------------------- -->
+<dialog id="new-dialog">
+  <h1>Start a new book</h1>
+  <p class="muted">The Discover agent turns this into a full brief. Be as specific as you like.</p>
+  <form id="new-form" method="dialog">
+    <label>
+      <span>Working title</span>
+      <input id="np-title" required maxlength="200" placeholder="The Lantern Keeper">
+    </label>
+    <label>
+      <span>The idea</span>
+      <textarea id="np-idea" required minlength="10" maxlength="20000"
+        placeholder="A lighthouse keeper on a dying coast discovers the light is answering something out at sea…"></textarea>
+    </label>
+    <div class="grid" style="grid-template-columns:1fr 1fr;gap:0 14px">
+      <label><span>Genre (optional)</span><input id="np-genre" maxlength="100" placeholder="Literary fantasy"></label>
+      <label><span>Audience (optional)</span><input id="np-audience" maxlength="200" placeholder="Adult"></label>
+    </div>
+    <div class="row" style="justify-content:flex-end;margin-top:6px">
+      <button type="button" class="ghost" id="np-cancel">Cancel</button>
+      <button class="primary" id="np-submit" value="create">Start forging</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Confirm ------------------------------------------------------ -->
+<dialog id="confirm-dialog">
+  <h1 id="confirm-title">Confirm</h1>
+  <p id="confirm-body" class="muted"></p>
+  <div class="row" style="justify-content:flex-end">
+    <button type="button" class="ghost" id="confirm-no">Cancel</button>
+    <button type="button" class="primary" id="confirm-yes">Confirm</button>
+  </div>
+</dialog>
+
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>
