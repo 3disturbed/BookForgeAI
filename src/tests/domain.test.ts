@@ -308,3 +308,56 @@ test('every added usage_ledger column reaches an existing database', async () =>
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('diagnosis cannot rank a task above the critiques it merged', async () => {
+  const { __testing } = await import('../agents/runner.js');
+  const tasks = {
+    chapterNumber: 1,
+    verdict: 'revise',
+    tasks: [
+      { id: 'a', severity: 'critical', instruction: 'Cut the anachronism.' },
+      { id: 'b', severity: 'major', instruction: 'Tighten the opening.' },
+      { id: 'c', severity: 'minor', instruction: 'Vary sentence length.' },
+    ],
+  };
+
+  // The critics went no higher than major: the critical task is capped there
+  // and the chapter still needs its rewrite.
+  const majorAtMost = [{ issues: [{ severity: 'major' }, { severity: 'minor' }] }, { issues: [] }];
+  const capped = __testing.clampTaskSeverity(tasks, majorAtMost) as typeof tasks;
+  assert.deepEqual(capped.tasks.map((t) => t.severity), ['major', 'major', 'minor']);
+  assert.equal(capped.verdict, 'revise');
+
+  // The critics raised nothing: every task is minor and the verdict follows.
+  const quiet = __testing.clampTaskSeverity(tasks, [{ issues: [] }]) as typeof tasks;
+  assert.deepEqual(quiet.tasks.map((t) => t.severity), ['minor', 'minor', 'minor']);
+  assert.equal(quiet.verdict, 'pass');
+
+  // Within the ceiling, nothing changes.
+  const critical = [{ issues: [{ severity: 'critical' }] }];
+  assert.deepEqual(__testing.clampTaskSeverity(tasks, critical), tasks);
+  const clean = { chapterNumber: 2, verdict: 'pass', tasks: [] };
+  assert.deepEqual(__testing.clampTaskSeverity(clean, []), clean);
+});
+
+test('a critic rejecting the chapter outright sets a critical ceiling', async () => {
+  const { __testing } = await import('../agents/runner.js');
+  const tasks = {
+    chapterNumber: 1,
+    verdict: 'revise',
+    tasks: [{ id: 'a', severity: 'critical', instruction: 'Rebuild the ending.' }],
+  };
+  const rejected = [{ verdict: 'reject', issues: [{ severity: 'major' }] }];
+  assert.deepEqual(__testing.clampTaskSeverity(tasks, rejected), tasks);
+
+  const merelyRevise = [{ verdict: 'revise', issues: [{ severity: 'major' }] }];
+  const capped = __testing.clampTaskSeverity(tasks, merelyRevise) as typeof tasks;
+  assert.equal(capped.tasks[0]!.severity, 'major');
+});
+
+test('a budget spent on issues below critical ends the loop instead of escalating', () => {
+  assert.equal(revisionDecision({ cycle: 1, maxCycles: 3, openCriticalIssues: 0, openIssues: 1 }), 'rewrite');
+  assert.equal(revisionDecision({ cycle: 3, maxCycles: 3, openCriticalIssues: 0, openIssues: 2 }), 'pass');
+  assert.equal(revisionDecision({ cycle: 3, maxCycles: 3, openCriticalIssues: 1, openIssues: 2 }), 'escalate');
+  assert.equal(revisionDecision({ cycle: 0, maxCycles: 3, openCriticalIssues: 0, openIssues: 0 }), 'pass');
+});

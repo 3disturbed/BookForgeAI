@@ -37,12 +37,21 @@ Default gates: brief, architecture, visual canon, outline, final manuscript, key
 ## 7. Revision loop
 
 ```text
-MANUSCRIPT → CRITICS → DIAGNOSIS → REVISION TASKS → REWRITE → CRITICS
-                                      ↓
-                                  PASS? → EDIT
+MANUSCRIPT → CRITICS → DIAGNOSIS → REVISION TASKS → REWRITE → CRITICS (that chapter only)
+                                      ↓                 ↓
+                                  PASS? → EDIT    nothing at the re-read
+                                                  severity? → EDIT
 ```
 
-Maximum default revision cycles: 3.
+Diagnosis may not rank a task above the highest severity the chapter's critics
+assigned; the cap is enforced on its output. After a rewrite, only chapters
+whose plan carried a task at or above `REVISION_REREAD_SEVERITY` (default
+`critical`) return to the critics, and only those chapters are re-read; the
+rest proceed to edit with their last critique standing.
+
+Maximum default revision cycles: 3. Exhausting the budget with critical issues
+still open escalates to a human; a budget spent on lesser issues ends the loop,
+since nothing left blocks publication (section 11).
 
 ## 8. Technical architecture
 

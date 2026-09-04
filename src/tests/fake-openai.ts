@@ -186,31 +186,48 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
   },
   {
     match: 'You are an independent critic',
-    body: (user) => ({
-      persona: 'literary',
-      chapterNumber: chapterNumberFrom(user),
-      verdict: 'pass',
-      issues: [],
-      strengths: ['Controlled imagery'],
-    }),
+    body: (user) => {
+      // Raises the issue diagnosis is about to act on, so the commit-time
+      // severity clamp sees a critique that supports the demanded task.
+      const severity = demandedSeverity();
+      return {
+        persona: 'literary',
+        chapterNumber: chapterNumberFrom(user),
+        verdict: severity ? 'revise' : 'pass',
+        issues: severity
+          ? [{
+              severity, area: 'fact',
+              description: 'The claim in paragraph two is unsupported.',
+              evidence: 'Paragraph two.',
+            }]
+          : [],
+        strengths: ['Controlled imagery'],
+      };
+    },
   },
   {
     match: 'You are the Diagnosis agent',
     body: (user) => {
-      // Demands a rewrite for the first `demandRewrites` diagnoses, so a test
-      // can drive the editorial loop round more than once.
-      const demand = state.demandRewrites > 0;
-      if (demand) state.demandRewrites--;
+      // Demands a rewrite for the first `demandRewrites` diagnoses (critical),
+      // then for the first `demandMajorRewrites` (major), so a test can drive
+      // the editorial loop round more than once, or once without a re-read.
+      // `inflateDiagnosis` instead claims a critical task the critics never
+      // raised, which the runner's severity clamp has to undo.
+      const inflated = state.inflateDiagnosis > 0;
+      if (inflated) state.inflateDiagnosis--;
+      const severity = inflated ? 'critical' : demandedSeverity();
+      if (!inflated && severity === 'critical') state.demandRewrites--;
+      if (!inflated && severity === 'major') state.demandMajorRewrites--;
       return {
         chapterNumber: chapterNumberFrom(user),
-        tasks: demand
+        tasks: severity
           ? [{
-              id: 't1', severity: 'critical',
+              id: 't1', severity,
               instruction: 'Fix the unsupported claim in paragraph two.',
               rationale: 'Flagged by the factual critic.', sourceCritiques: ['factual'],
             }]
           : [],
-        verdict: demand ? 'revise' : 'pass',
+        verdict: severity ? 'revise' : 'pass',
       };
     },
   },
@@ -287,6 +304,13 @@ const FIXTURES: { match: string; body: (user: string) => unknown }[] = [
   },
 ];
 
+/** Severity the demand knobs currently ask for: critical first, then major, else none. */
+function demandedSeverity(): 'critical' | 'major' | null {
+  if (state.demandRewrites > 0) return 'critical';
+  if (state.demandMajorRewrites > 0) return 'major';
+  return null;
+}
+
 function chapterNumberFrom(user: string): number {
   const scope = /ch(\d+)/.exec(user);
   return scope ? Number(scope[1]) : 1;
@@ -299,6 +323,10 @@ function sceneKeyFrom(user: string): string {
 /** Mutable stub state, so a test can steer the pipeline down a branch. */
 export const state = {
   demandRewrites: 0,
+  /** Like demandRewrites, but the issue and task raised are `major`, not `critical`. */
+  demandMajorRewrites: 0,
+  /** Diagnoses that emit a critical task whatever the critics raised; the runner must clamp it. */
+  inflateDiagnosis: 0,
   /** When set, chat calls whose system prompt contains this text return JSON that fails every schema. */
   breakSchemaFor: '' as string,
   /**

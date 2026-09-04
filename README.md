@@ -147,9 +147,12 @@ later change needs a new version and a fresh approval.
 
 **The revision loop.** Five independent critics (literary, structural, audience,
 factual, continuity) review every chapter. Diagnosis merges their findings into
-an ordered revision plan, the Rewriter applies it, and the critics read it again
-— bounded by `MAX_REVISION_CYCLES`. Exhausting the budget with critical issues
-still open escalates to a human rather than shipping silently.
+an ordered revision plan, capped at the severity the critics themselves
+assigned, and the Rewriter applies it. Only a chapter whose plan carried an
+issue at `REVISION_REREAD_SEVERITY` (default `critical`) goes back to the
+critics, and only that chapter; the loop is bounded by `MAX_REVISION_CYCLES`.
+Exhausting the budget with critical issues still open escalates to a human
+rather than shipping silently.
 
 **Visual continuity.** Recurring characters, objects and locations get a
 canonical specification and approved reference art before ordinary illustration
@@ -245,5 +248,7 @@ Known limits of the MVP:
   retrying once before accepting the gap.
 - Chromium adds roughly 300MB to `npm install`. Set `PDF_RENDERER=pdfkit` to
   skip it, at the cost of typography.
-- The editorial loop re-reads every chapter each round, so a book that needs all
-  three cycles pays for three full critique passes.
+- A chapter rewritten for a critical issue is re-read by all five critics, so a
+  book whose criticals survive rewriting pays for up to `MAX_REVISION_CYCLES`
+  critique passes over those chapters. Rewrites for major issues are trusted
+  unless `REVISION_REREAD_SEVERITY=major`.

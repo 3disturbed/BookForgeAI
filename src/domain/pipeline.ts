@@ -143,17 +143,25 @@ export interface RevisionLoopState {
   maxCycles: number;
   /** Critical issues still open after the last critique pass. */
   openCriticalIssues: number;
+  /**
+   * Issues at the re-read bar, which may sit below critical. Defaults to the
+   * critical count. Only critical issues can escalate; a budget spent on
+   * lesser ones ends the loop.
+   */
+  openIssues?: number;
 }
 
 export type RevisionDecision = 'rewrite' | 'pass' | 'escalate';
 
 /**
  * CRITICS -> DIAGNOSIS -> REVISION TASKS -> REWRITE -> CRITICS, bounded by
- * MAX_REVISION_CYCLES. Exhausting the budget with issues still open escalates
- * to a human rather than shipping silently.
+ * MAX_REVISION_CYCLES. Exhausting the budget with critical issues still open
+ * escalates to a human rather than shipping silently; exhausting it on lesser
+ * issues ends the loop, since nothing left blocks publication.
  */
 export function revisionDecision(state: RevisionLoopState): RevisionDecision {
-  if (state.openCriticalIssues === 0) return 'pass';
-  if (state.cycle >= state.maxCycles) return 'escalate';
+  const openIssues = state.openIssues ?? state.openCriticalIssues;
+  if (openIssues === 0) return 'pass';
+  if (state.cycle >= state.maxCycles) return state.openCriticalIssues > 0 ? 'escalate' : 'pass';
   return 'rewrite';
 }

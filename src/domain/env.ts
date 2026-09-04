@@ -55,6 +55,13 @@ const EnvSchema = z.object({
   BOOK_PUBLISHING_PRICE_USD: z.coerce.number().positive().default(100),
   BOOK_PUBLISHING_CURRENCY: z.string().default('usd'),
   MAX_REVISION_CYCLES: z.coerce.number().int().min(1).max(10).default(3),
+  /**
+   * Severity that sends a rewritten chapter back to the critics. `critical`
+   * re-reads only chapters whose diagnosis found something that blocks
+   * publication; `major` re-reads after any substantive rewrite. Each re-read
+   * is a full critique round, so this is the loop's main cost lever.
+   */
+  REVISION_REREAD_SEVERITY: z.enum(['critical', 'major']).default('critical'),
 
   /** Concurrent agent jobs per worker loop. */
   AGENT_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(3),

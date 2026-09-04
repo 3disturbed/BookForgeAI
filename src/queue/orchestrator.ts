@@ -43,7 +43,7 @@ function chapterNumbers(projectId: string): number[] {
   return (outline?.data.chapters ?? []).map((c) => c.number).sort((a, b) => a - b);
 }
 
-function planJobs(project: repo.ProjectRow, agent: AgentName): PlannedJob[] {
+function planJobs(project: repo.ProjectRow, agent: AgentName, round = 0): PlannedJob[] {
   const def = agentDefinition(agent);
 
   switch (def.cardinality) {
@@ -51,7 +51,13 @@ function planJobs(project: repo.ProjectRow, agent: AgentName): PlannedJob[] {
       return [{ scopeKey: null }];
 
     case 'chapter': {
-      const chapters = chapterNumbers(project.id);
+      // After the first round, critics and diagnosis re-read only the chapters
+      // whose previous diagnosis carried an issue worth a full critique pass.
+      // Every other chapter keeps its last critique; re-reading it would cost
+      // five critic calls to learn nothing the loop asked for.
+      const chapters = round > 0 && (agent === 'critics' || agent === 'diagnosis')
+        ? chaptersToReread(project, round - 1)
+        : chapterNumbers(project.id);
       const scoped = chapters.map((n) => ({ scopeKey: chapterScope(n) }));
       if (!def.personas) return scoped;
       // Critics fan out across chapters and personas.
@@ -77,12 +83,78 @@ function planJobs(project: repo.ProjectRow, agent: AgentName): PlannedJob[] {
   }
 }
 
-/** Only rewrites chapters that diagnosis actually flagged. */
-function planRewrites(project: repo.ProjectRow): PlannedJob[] {
-  return repo
-    .latestArtifactsOfKind<{ verdict: string }>(project.id, 'revision_tasks')
-    .filter((a) => a.data.verdict === 'revise' && a.scopeKey)
-    .map((a) => ({ scopeKey: a.scopeKey }));
+const SEVERITY_RANK: Record<string, number> = { critical: 2, major: 1, minor: 0 };
+
+/** Issues at or above this rank send a rewritten chapter back to the critics. */
+function rereadThreshold(): number {
+  return SEVERITY_RANK[env().REVISION_REREAD_SEVERITY] ?? 2;
+}
+
+interface RewrittenDiagnosis {
+  chapter: number;
+  tasks: { severity: string }[];
+}
+
+/**
+ * The diagnoses that drove this round's completed rewrites, one per chapter.
+ * Built from job rows and the artifacts they produced, both immutable, so the
+ * answer cannot drift while the next round's diagnoses are being written.
+ */
+function rewrittenDiagnoses(project: repo.ProjectRow, round: number): RewrittenDiagnosis[] {
+  const rewritten = new Set(
+    repo.jobsForAgent(project.id, 'rewrite', 'rewriter', round)
+      .filter((j) => j.status === 'completed' && j.scopeKey)
+      .map((j) => j.scopeKey!),
+  );
+
+  // Keyed by scope so a retried job row cannot count a chapter twice.
+  const byScope = new Map<string, RewrittenDiagnosis>();
+  for (const job of repo.jobsForAgent(project.id, 'diagnose', 'diagnosis', round)) {
+    if (job.status !== 'completed' || !job.scopeKey || !rewritten.has(job.scopeKey)) continue;
+    const diagnosis = repo.getArtifact<{ tasks?: { severity: string }[] }>(job.outputArtifactIds[0] ?? '');
+    if (!diagnosis) continue;
+    byScope.set(job.scopeKey, {
+      chapter: Number(job.scopeKey.replace(/^ch/, '')),
+      tasks: diagnosis.data.tasks ?? [],
+    });
+  }
+  return [...byScope.values()].sort((a, b) => a.chapter - b.chapter);
+}
+
+/**
+ * Chapters rewritten in `round` whose driving diagnosis carried an issue at
+ * or above the re-read severity.
+ */
+function chaptersToReread(project: repo.ProjectRow, round: number): number[] {
+  const threshold = rereadThreshold();
+  return rewrittenDiagnoses(project, round)
+    .filter((d) => d.tasks.some((t) => (SEVERITY_RANK[t.severity] ?? 0) >= threshold))
+    .map((d) => d.chapter);
+}
+
+/** Critical tasks among the diagnoses that drove this round's rewrites. */
+function openCriticalTasks(project: repo.ProjectRow, round: number): number {
+  return rewrittenDiagnoses(project, round).reduce(
+    (n, d) => n + d.tasks.filter((t) => t.severity === 'critical').length,
+    0,
+  );
+}
+
+/**
+ * Only rewrites chapters that this round's diagnosis actually flagged. Planned
+ * from the round's completed diagnosis jobs, not from the latest artifact per
+ * chapter: a chapter rewritten in an earlier round and not re-read keeps its
+ * old `revise` verdict as its latest artifact, and planning from that would
+ * rewrite it again every round for tasks the first rewrite already answered.
+ */
+function planRewrites(project: repo.ProjectRow, round: number): PlannedJob[] {
+  const scopes = new Set<string>();
+  for (const job of repo.jobsForAgent(project.id, 'diagnose', 'diagnosis', round)) {
+    if (job.status !== 'completed' || !job.scopeKey) continue;
+    const diagnosis = repo.getArtifact<{ verdict?: string }>(job.outputArtifactIds[0] ?? '');
+    if (diagnosis?.data.verdict === 'revise') scopes.add(job.scopeKey);
+  }
+  return [...scopes].map((scopeKey) => ({ scopeKey }));
 }
 
 function keyOf(job: { scopeKey: string | null; persona?: string | null }): string {
@@ -135,7 +207,7 @@ export function advanceProject(projectId: string): void {
       const seen = new Set(existing.map(keyOf));
 
       const planned =
-        agent === 'rewriter' ? planRewrites(project) : planJobs(project, agent);
+        agent === 'rewriter' ? planRewrites(project, round) : planJobs(project, agent, round);
       const missing = planned.filter((p) => !seen.has(keyOf(p)));
 
       if (missing.length > 0) {
@@ -322,28 +394,23 @@ function syncProjectFromBrief(projectId: string): void {
  * looped back for another critique pass over the revised text.
  */
 function applyRevisionDecision(project: repo.ProjectRow): boolean {
-  const diagnoses = repo.latestArtifactsOfKind<{
-    verdict: string;
-    tasks: { severity: string }[];
-  }>(project.id, 'revision_tasks');
-
-  // Nothing was rewritten this round, so there is nothing new to re-read.
-  const rewroteSomething = diagnoses.some((a) => a.data.verdict === 'revise');
-  if (!rewroteSomething) return false;
-
-  const openCriticalIssues = diagnoses
-    .filter((a) => a.data.verdict === 'revise')
-    .reduce(
-      (total, a) => total + (a.data.tasks ?? []).filter((t) => t.severity === 'critical').length,
-      0,
-    );
+  // Only chapters rewritten this round whose diagnosis carried an issue at the
+  // re-read severity go back to the critics. A rewrite that answered nothing
+  // above that bar is trusted: verifying it costs a full critique round, and on
+  // the measured runs those rounds found nothing the critics had asked for.
+  const cycle = project.revisionCycle;
+  const reread = chaptersToReread(project, cycle);
+  if (reread.length === 0) return false;
+  // The re-read bar can sit below critical, but only critical issues block
+  // publication, so only they can turn an exhausted budget into an escalation.
+  const openIssues = reread.length;
+  const openCriticalIssues = openCriticalTasks(project, cycle);
 
   const decision = revisionDecision({
-    cycle: project.revisionCycle,
+    cycle,
     maxCycles: env().MAX_REVISION_CYCLES,
-    // A round that rewrote anything is worth re-reading even if its remaining
-    // issues were all non-critical, so the loop verifies its own work.
-    openCriticalIssues: Math.max(openCriticalIssues, 1),
+    openCriticalIssues,
+    openIssues,
   });
 
   if (decision === 'pass') return false;
@@ -355,7 +422,7 @@ function applyRevisionDecision(project: repo.ProjectRow): boolean {
       projectId: project.id,
       type: 'REVISION_REQUIRED',
       actor: 'system',
-      payload: { openCriticalIssues, exhausted: true },
+      payload: { openCriticalIssues, openIssues, exhausted: true },
     });
     setStatus(project.id, 'review');
     return false;
@@ -365,12 +432,12 @@ function applyRevisionDecision(project: repo.ProjectRow): boolean {
     projectId: project.id,
     type: 'REVISION_REQUIRED',
     actor: 'system',
-    payload: { openCriticalIssues, cycle: project.revisionCycle + 1 },
+    payload: { openCriticalIssues, openIssues, cycle: cycle + 1 },
   });
 
   // Reopen the loop stages at the next round so critics re-read revised text.
   repo.updateProject(project.id, {
-    revisionCycle: project.revisionCycle + 1,
+    revisionCycle: cycle + 1,
     completedStages: project.completedStages.filter((s) => !LOOP_STAGES.has(s)),
   });
   return true;

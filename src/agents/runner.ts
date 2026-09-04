@@ -406,12 +406,19 @@ export async function executeAgent(
 
     case 'diagnosis': {
       const scope = job.scopeKey ?? '';
-      return reason([
-        asUntrustedData('critiques', critiquesForChapter(project.id, scope)),
+      const critiques = critiquesForChapter(project.id, scope);
+      const outcome = await reason([
+        asUntrustedData('critiques', critiques),
         asUntrustedData('chapter', currentChapter(project.id, scope) ?? {}),
         asUntrustedData('design_spec', requireSingle(project.id, 'design_spec')),
         asUntrustedData('outline', requireSingle(project.id, 'outline')),
       ]);
+      // Diagnosis merges critiques; it does not get to raise the stakes above
+      // them. On the measured runs it invented critical tasks in rounds where
+      // no critic had found one, and the loop ran on those. Enforced here, in
+      // the same spirit as the other commit-time rules.
+      outcome.data = clampTaskSeverity(outcome.data, critiques);
+      return outcome;
     }
 
     case 'rewriter': {
@@ -678,6 +685,58 @@ function normaliseArtifact(
   return { ...chapter, wordCount };
 }
 
+type TaskSeverity = 'critical' | 'major' | 'minor';
+const SEVERITY_RANK: Record<TaskSeverity, number> = { critical: 2, major: 1, minor: 0 };
+
+function severityOf(value: unknown): TaskSeverity | null {
+  return value === 'critical' || value === 'major' || value === 'minor' ? value : null;
+}
+
+/**
+ * Highest severity any critic assigned; `minor` when they raised nothing. A
+ * critic who rejects the chapter outright has said more than any issue tag,
+ * so a `reject` verdict is a critical ceiling on its own.
+ */
+function maxCritiqueSeverity(critiques: unknown): TaskSeverity {
+  let ceiling: TaskSeverity = 'minor';
+  for (const critique of Array.isArray(critiques) ? critiques : []) {
+    const row = critique as { verdict?: unknown; issues?: unknown } | null;
+    if (row?.verdict === 'reject') return 'critical';
+    const issues = row?.issues;
+    for (const issue of Array.isArray(issues) ? issues : []) {
+      const severity = severityOf((issue as { severity?: unknown } | null)?.severity);
+      if (severity && SEVERITY_RANK[severity] > SEVERITY_RANK[ceiling]) ceiling = severity;
+    }
+  }
+  return ceiling;
+}
+
+/**
+ * Cap every revision task at the highest severity the chapter's critiques
+ * assigned. A chapter left with nothing at `major` or above needs no rewrite,
+ * so a `revise` verdict becomes `pass`, which is the diagnosis prompt's own
+ * rule applied deterministically.
+ */
+function clampTaskSeverity(data: unknown, critiques: unknown): unknown {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return data;
+  const record = data as Record<string, unknown>;
+  if (!Array.isArray(record.tasks)) return data;
+  const ceiling = maxCritiqueSeverity(critiques);
+  const tasks = record.tasks.map((task) => {
+    if (typeof task !== 'object' || task === null) return task;
+    const severity = severityOf((task as { severity?: unknown }).severity);
+    if (!severity || SEVERITY_RANK[severity] <= SEVERITY_RANK[ceiling]) return task;
+    return { ...(task as Record<string, unknown>), severity: ceiling };
+  });
+  const needsRewrite = tasks.some((task) => {
+    const severity = severityOf((task as { severity?: unknown } | null)?.severity);
+    return severity !== null && SEVERITY_RANK[severity] >= SEVERITY_RANK.major;
+  });
+  const clamped: Record<string, unknown> = { ...record, tasks };
+  if (record.verdict === 'revise' && !needsRewrite) clamped.verdict = 'pass';
+  return clamped;
+}
+
 function negativeClause(negatives: (string | undefined)[]): string {
   const items = negatives.filter((n): n is string => Boolean(n && n.trim()));
   return items.length ? `Avoid: ${items.join('; ')}.` : '';
@@ -820,4 +879,4 @@ function isRetryable(error: unknown): boolean {
 }
 
 /** Exposed for unit tests only. */
-export const __testing = { normaliseArtifact };
+export const __testing = { normaliseArtifact, clampTaskSeverity };

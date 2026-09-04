@@ -36,6 +36,7 @@ before(async () => {
     OPENAI_IMAGE_MODEL: 'test-image',
     ENABLE_ILLUSTRATIONS: 'true',
     MAX_REVISION_CYCLES: '3',
+    REVISION_REREAD_SEVERITY: 'critical',
     APP_BASE_URL: 'http://localhost:3000',
   });
 
@@ -270,6 +271,242 @@ test('a loop that never satisfies the critics escalates instead of spinning', as
     .filter((a) => a.data.verdict === 'revise')
     .reduce((n, a) => n + (a.data.tasks ?? []).filter((t) => t.severity === 'critical').length, 0);
   assert.ok(openCritical > 0, 'critical issues remain open, so acceptance must block');
+});
+
+test('a rewrite driven only by major tasks is not sent back to the critics', async () => {
+  // One chapter has a major note: it is rewritten, but nothing blocks
+  // publication, so the loop exits without a further critique round.
+  fakeState.demandMajorRewrites = 1;
+
+  const user = repo.upsertUser('major@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Major', idea: 'A book with one major note.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.demandMajorRewrites = 0;
+  }
+
+  const after = repo.getProject(project.id)!;
+  const jobs = repo.listJobs(project.id, 500);
+
+  assert.equal(jobs.filter((j) => j.agent === 'rewriter').length, 1, 'the major task was still rewritten');
+  assert.equal(
+    jobs.filter((j) => j.agent === 'critics' && j.round > 0).length, 0,
+    'a major-only rewrite is not re-read',
+  );
+  assert.equal(jobs.filter((j) => j.agent === 'diagnosis' && j.round > 0).length, 0);
+  assert.ok(after.completedStages.includes('proof'), 'the pipeline ran to completion');
+  assert.equal(jobs.filter((j) => j.status === 'queued' || j.status === 'running').length, 0);
+});
+
+test('only the chapter whose diagnosis found a critical issue is re-critiqued', async () => {
+  // Two chapters, one critical finding: the re-read covers that chapter alone.
+  fakeState.demandRewrites = 1;
+
+  const user = repo.upsertUser('scoped@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Scoped', idea: 'A book with one critical note.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.demandRewrites = 0;
+  }
+
+  const chapterOf = (scopeKey: string | null | undefined) => (scopeKey ?? '').split('#')[0];
+  const jobs = repo.listJobs(project.id, 500);
+  const rewrites = jobs.filter((j) => j.agent === 'rewriter');
+  assert.equal(rewrites.length, 1, 'exactly one chapter was rewritten');
+  const flagged = chapterOf(rewrites[0]!.scopeKey);
+
+  assert.equal(jobs.filter((j) => j.agent === 'critics' && j.round === 0).length, 10);
+  const reread = jobs.filter((j) => j.agent === 'critics' && j.round > 0);
+  assert.equal(reread.length, 5, 'five personas re-read exactly one chapter');
+  assert.ok(reread.every((j) => chapterOf(j.scopeKey) === flagged), 'the re-read is the rewritten chapter');
+
+  const rediagnosed = jobs.filter((j) => j.agent === 'diagnosis' && j.round > 0);
+  assert.equal(rediagnosed.length, 1);
+  assert.equal(chapterOf(rediagnosed[0]!.scopeKey), flagged);
+
+  const after = repo.getProject(project.id)!;
+  assert.ok(after.completedStages.includes('proof'), 'the pipeline ran to completion');
+  assert.equal(jobs.filter((j) => j.status === 'queued' || j.status === 'running').length, 0);
+});
+
+test('a chapter rewritten for a major task is not rewritten again while another chapter loops', async () => {
+  // Chapter one carries a critical task, chapter two a major one. Both are
+  // rewritten once; only chapter one is re-read. Chapter two's old verdict must
+  // not drive a second rewrite in the round it sat out.
+  fakeState.demandRewrites = 1;
+  fakeState.demandMajorRewrites = 1;
+
+  const user = repo.upsertUser('stale@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Stale', idea: 'A book with one critical and one major note.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.demandRewrites = 0;
+    fakeState.demandMajorRewrites = 0;
+  }
+
+  const jobs = repo.listJobs(project.id, 500);
+  const rewrites = jobs.filter((j) => j.agent === 'rewriter');
+  assert.equal(rewrites.length, 2, 'each flagged chapter was rewritten exactly once');
+  assert.ok(rewrites.every((j) => j.round === 0), 'no rewrite ran in the re-read round');
+  assert.equal(new Set(rewrites.map((j) => j.scopeKey)).size, 2, 'the two rewrites are two chapters');
+
+  const reread = jobs.filter((j) => j.agent === 'critics' && j.round > 0);
+  assert.equal(reread.length, 5, 'one chapter was re-read');
+  assert.equal(jobs.filter((j) => j.agent === 'diagnosis' && j.round > 0).length, 1);
+
+  const after = repo.getProject(project.id)!;
+  assert.ok(after.completedStages.includes('proof'), 'the pipeline ran to completion');
+  assert.equal(jobs.filter((j) => j.status === 'queued' || j.status === 'running').length, 0);
+});
+
+test('a diagnosis that outranks its critiques is clamped and does not reopen the loop', async () => {
+  // The critics raise nothing; diagnosis claims a critical task anyway. The
+  // stored plan carries the critics' ceiling and nothing is rewritten.
+  fakeState.inflateDiagnosis = 1;
+
+  const user = repo.upsertUser('inflate@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Inflate', idea: 'A book whose diagnosis exaggerates.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.inflateDiagnosis = 0;
+  }
+
+  const plans = repo.latestArtifactsOfKind<{ verdict: string; tasks: { severity: string }[] }>(
+    project.id, 'revision_tasks',
+  );
+  assert.equal(plans.length, 2);
+  const inflated = plans.filter((p) => p.data.tasks.length > 0);
+  assert.equal(inflated.length, 1, 'one diagnosis carried the invented task');
+  assert.ok(
+    inflated[0]!.data.tasks.every((t) => t.severity === 'minor'),
+    'the task was capped at what the critics raised',
+  );
+  assert.ok(plans.every((p) => p.data.verdict === 'pass'), 'a plan with nothing above minor is a pass');
+
+  const jobs = repo.listJobs(project.id, 500);
+  assert.equal(jobs.filter((j) => j.agent === 'rewriter').length, 0, 'nothing was rewritten');
+  assert.equal(jobs.filter((j) => j.round > 0).length, 0, 'the loop did not reopen');
+  const after = repo.getProject(project.id)!;
+  assert.equal(after.revisionCycle, 0);
+  assert.ok(after.completedStages.includes('proof'), 'the pipeline ran to completion');
+});
+
+test('a diagnosis raised above major-only critiques is rewritten as major and not re-read', async () => {
+  // Every critic says major; one diagnosis says critical. The stored task is
+  // major, so the chapter is rewritten once and trusted.
+  fakeState.inflateDiagnosis = 1;
+  fakeState.demandMajorRewrites = 1;
+
+  const user = repo.upsertUser('capped@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Capped', idea: 'A book whose diagnosis overstates a major note.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.inflateDiagnosis = 0;
+    fakeState.demandMajorRewrites = 0;
+  }
+
+  const plans = repo.latestArtifactsOfKind<{ verdict: string; tasks: { severity: string }[] }>(
+    project.id, 'revision_tasks',
+  );
+  assert.equal(plans.length, 2);
+  assert.ok(
+    plans.every((p) => p.data.verdict === 'revise' && p.data.tasks.every((t) => t.severity === 'major')),
+    'both plans carry the critics\' ceiling',
+  );
+
+  const jobs = repo.listJobs(project.id, 500);
+  const rewrites = jobs.filter((j) => j.agent === 'rewriter');
+  assert.equal(rewrites.length, 2, 'both chapters were rewritten');
+  assert.ok(rewrites.every((j) => j.round === 0));
+  assert.equal(jobs.filter((j) => j.round > 0).length, 0, 'a major-only rewrite is not re-read');
+  assert.ok(repo.getProject(project.id)!.completedStages.includes('proof'));
+});
+
+test('REVISION_REREAD_SEVERITY=major sends a major-only rewrite back to the critics', async () => {
+  const { resetEnvCache } = await import('../domain/env.js');
+  process.env.REVISION_REREAD_SEVERITY = 'major';
+  resetEnvCache();
+  fakeState.demandMajorRewrites = 1;
+
+  const user = repo.upsertUser('reread-major@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Reread', idea: 'A book that re-reads major rewrites.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.demandMajorRewrites = 0;
+    process.env.REVISION_REREAD_SEVERITY = 'critical';
+    resetEnvCache();
+  }
+
+  const jobs = repo.listJobs(project.id, 500);
+  assert.equal(jobs.filter((j) => j.agent === 'rewriter').length, 1, 'one chapter was rewritten');
+  assert.equal(jobs.filter((j) => j.agent === 'critics' && j.round > 0).length, 5, 'that chapter was re-read');
+  assert.equal(jobs.filter((j) => j.agent === 'diagnosis' && j.round > 0).length, 1);
+
+  const after = repo.getProject(project.id)!;
+  assert.equal(after.revisionCycle, 1);
+  const exhausted = repo
+    .listEvents(project.id, 200)
+    .filter((e) => e.type === 'REVISION_REQUIRED' && e.payload.exhausted === true);
+  assert.equal(exhausted.length, 0, 'nothing critical was open, so nothing escalated');
+  assert.ok(after.completedStages.includes('proof'), 'the pipeline ran to completion');
+});
+
+test('a budget spent on major issues alone ends the loop without escalating', async () => {
+  // With the re-read bar at major and critics who never stop finding majors,
+  // the loop uses its budget and then moves on: nothing blocks publication.
+  const { resetEnvCache } = await import('../domain/env.js');
+  process.env.REVISION_REREAD_SEVERITY = 'major';
+  resetEnvCache();
+  fakeState.demandMajorRewrites = Number.MAX_SAFE_INTEGER;
+
+  const user = repo.upsertUser('majors-forever@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Majors', idea: 'A book the critics always want tightened.',
+  });
+
+  try {
+    await drain(project.id);
+  } finally {
+    fakeState.demandMajorRewrites = 0;
+    process.env.REVISION_REREAD_SEVERITY = 'critical';
+    resetEnvCache();
+  }
+
+  const after = repo.getProject(project.id)!;
+  const maxCycles = Number(process.env.MAX_REVISION_CYCLES ?? 3);
+  assert.equal(after.revisionCycle, maxCycles, 'the loop used its whole budget');
+
+  const events = repo.listEvents(project.id, 300).filter((e) => e.type === 'REVISION_REQUIRED');
+  assert.equal(events.filter((e) => e.payload.exhausted === true).length, 0, 'majors alone do not escalate');
+  assert.equal(events.length, maxCycles, 'one reopen per cycle');
+
+  assert.ok(after.completedStages.includes('proof'), 'the book moved on');
+  const jobs = repo.listJobs(project.id, 800);
+  assert.equal(jobs.filter((j) => j.status === 'queued' || j.status === 'running').length, 0);
 });
 
 test('payment confirmation is idempotent', async () => {
