@@ -395,6 +395,15 @@ function renderOpenQuestions() {
           }, 'Leave to BookForgeAI')),
       )),
 
+    (decisions.corrections ?? []).length > 0 &&
+      el('div', { class: 'notice ok', style: 'margin-top:12px' },
+        'Enforced spellings: ' +
+        decisions.corrections.map((c) => `${c.right} (never ${c.wrong})`).join(', ') + '. ',
+        el('button', {
+          class: 'small ghost',
+          onclick: repairTerms,
+        }, 'Apply to work already written')),
+
     el('div', { class: 'row', style: 'margin-top:14px' },
       el('button', {
         class: 'primary',
@@ -416,6 +425,21 @@ function renderOpenQuestions() {
       decisions.unanswered > 0 &&
         el('span', { class: 'tag warn' }, `${decisions.unanswered} unanswered`)),
   );
+}
+
+/** Rewrites artifacts and asset names written before the answer was given. */
+async function repairTerms() {
+  try {
+    const r = await api(`/projects/${state.current.project.id}/repair-terms`, {
+      method: 'POST', body: {},
+    });
+    alert(`Rewrote ${r.artifactsRewritten} artifact(s) and renamed ${r.assetsRenamed} asset(s).`);
+    state.current = await api(`/projects/${state.current.project.id}`);
+    state.cache = {};
+    render();
+  } catch (error) {
+    alert(error.message);
+  }
 }
 
 async function saveDecision(question, answer, delegated) {

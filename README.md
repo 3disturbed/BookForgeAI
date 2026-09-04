@@ -115,6 +115,14 @@ every later agent, which is told to follow them and not reopen them. A question
 the author would rather not settle can be delegated explicitly, so the agents
 decide it on the record instead of by default.
 
+**Spelling decisions are enforced, not requested.** An answer naming a ship
+"Mapado" rather than "Manado" was passed to the agents and ignored: Manado is a
+real place, and the model's own prior beat the instruction, so the wrong name
+reached the knowledge map and every later agent inherited it as canon. A
+naming answer now yields a correction that is applied to each artifact on the
+way into storage, and can be replayed over work already written, including
+locked visual assets that are otherwise uncorrectable.
+
 **Human approval gates.** Eight gates — brief, architecture, visual canon,
 outline, manuscript, key illustrations, final PDF, publication payment — hold the
 pipeline until a person approves. Approving the visual canon locks its assets; a

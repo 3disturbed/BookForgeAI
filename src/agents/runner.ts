@@ -6,6 +6,7 @@ import { BookForgeError, ContentRefusedError } from '../domain/errors.js';
 import { slug } from '../domain/ids.js';
 import { schemaFor } from '../domain/schemas.js';
 import { stripEmDashesDeep } from '../domain/typography.js';
+import { applyCorrectionsDeep, deriveCorrections, type TermCorrection } from '../domain/terms.js';
 import { storageKey } from '../domain/storage-paths.js';
 import type { UsageRecord } from '../domain/costs.js';
 import { asUntrustedData, generateImage, generateStructured } from '../ai/openai.js';
@@ -24,6 +25,8 @@ interface Outcome {
   artifactScopeKey?: string | null;
   /** Extra work to run after the artifact is committed. */
   afterCommit?: (artifactId: string) => void | Promise<void>;
+  /** Canonical spellings to enforce on the written artifact. */
+  corrections?: readonly TermCorrection[];
 }
 
 /* --------------------------- read helpers -------------------------- */
@@ -135,6 +138,9 @@ export async function executeAgent(
 
   const answered = (decisions?.data.answers ?? []).filter((a) => !a.delegated && a.answer.trim());
 
+  // Spelling decisions are enforced on the output rather than trusted to it.
+  const corrections = answered.flatMap((a) => deriveCorrections(a.question, a.answer));
+
   /** Shared path: assemble context, reason, validate, return. */
   const reason = async (contextParts: string[], overrides?: {
     system?: string;
@@ -150,6 +156,10 @@ export async function executeAgent(
         ? '\nThe author has already decided the questions in <author_decisions>. ' +
           'Follow those decisions exactly. Do not reopen them or choose otherwise.'
         : '',
+      corrections.length
+        ? '\nUse these exact spellings, even where another spelling looks more ' +
+          'familiar: ' + corrections.map((c) => `"${c.right}" (never "${c.wrong}")`).join(', ') + '.'
+        : '',
     ].join('');
 
     const result = await generateStructured({
@@ -162,6 +172,7 @@ export async function executeAgent(
       data: result.data,
       model: result.model,
       promptVersion: prompt.version,
+      corrections,
       usage: {
         textInputTokens: result.usage.textInputTokens,
         textOutputTokens: result.usage.textOutputTokens,
@@ -559,10 +570,16 @@ const CHAPTER_KINDS: ReadonlySet<string> = new Set([
  * count is displayed to users and used to judge length against the brief, so
  * it is recomputed from the committed text.
  */
-function normaliseArtifact(kind: string, data: unknown): unknown {
+function normaliseArtifact(
+  kind: string,
+  data: unknown,
+  corrections: readonly TermCorrection[] = [],
+): unknown {
   // House style is enforced on every artifact, not just prose: headings,
-  // captions, blurbs and notes all reach the finished PDF.
-  const value = stripEmDashesDeep(data);
+  // captions, blurbs and notes all reach the finished PDF. Canonical spellings
+  // are fixed here too: asking the model to honour them does not hold when its
+  // own prior prefers a real word to the author's invented one.
+  const value = applyCorrectionsDeep(stripEmDashesDeep(data), corrections);
 
   if (!CHAPTER_KINDS.has(kind) || typeof value !== 'object' || value === null) return value;
 
@@ -607,7 +624,7 @@ export async function runJob(job: repo.JobRow): Promise<void> {
       projectId: project.id,
       kind: def.writes,
       scopeKey: outcome.artifactScopeKey !== undefined ? outcome.artifactScopeKey : job.scopeKey,
-      data: normaliseArtifact(def.writes, outcome.data),
+      data: normaliseArtifact(def.writes, outcome.data, outcome.corrections ?? []),
       producedByJobId: job.id,
     });
 

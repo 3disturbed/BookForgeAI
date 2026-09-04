@@ -6,6 +6,7 @@ import type { StageId } from '../domain/pipeline.js';
 import type { ApprovalGate, AssetStatus, AssetType, JobStatus, ProjectStatus, PublicationState } from '../domain/states.js';
 import type { UsageRecord } from '../domain/costs.js';
 import { EMPTY_USAGE } from '../domain/costs.js';
+import { applyCorrections, applyCorrectionsDeep, type TermCorrection } from '../domain/terms.js';
 
 /* ----------------------------- users ----------------------------- */
 
@@ -849,6 +850,54 @@ export function requeueStaleJobs(maxRetries = 2): number {
     }
   }
   return stale.length;
+}
+
+/**
+ * Rewrites stored artifacts and visual asset names to the canonical spellings.
+ *
+ * Artifacts are normally immutable, but a spelling correction changes no
+ * meaning and leaving the wrong name in place would have every later agent
+ * inherit it. Locked assets are included: a locked asset with the wrong name is
+ * otherwise uncorrectable.
+ */
+export function applyTermCorrections(
+  projectId: string,
+  corrections: readonly TermCorrection[],
+): { artifacts: number; assets: number } {
+  if (corrections.length === 0) return { artifacts: 0, assets: 0 };
+  const db = database();
+
+  let artifacts = 0;
+  const rows = db.prepare('SELECT id, data FROM artifacts WHERE project_id = ?').all(projectId) as
+    Record<string, unknown>[];
+  const updateArtifact = db.prepare('UPDATE artifacts SET data = ? WHERE id = ?');
+  for (const row of rows) {
+    const before = row.data as string;
+    const after = JSON.stringify(applyCorrectionsDeep(JSON.parse(before), corrections));
+    if (after === before) continue;
+    updateArtifact.run(after, row.id as string);
+    artifacts++;
+  }
+
+  let assets = 0;
+  const assetRows = db
+    .prepare('SELECT id, name, canonical_description FROM visual_assets WHERE project_id = ?')
+    .all(projectId) as Record<string, unknown>[];
+  const updateAsset = db.prepare(
+    `UPDATE visual_assets SET name = ?, canonical_description = ?, version = version + 1,
+     updated_at = ? WHERE id = ?`,
+  );
+  for (const row of assetRows) {
+    const name = applyCorrections(row.name as string, corrections);
+    const description = JSON.stringify(
+      applyCorrectionsDeep(fromJson<Record<string, unknown>>(row.canonical_description, {}), corrections),
+    );
+    if (name === row.name && description === row.canonical_description) continue;
+    updateAsset.run(name, description, nowIso(), row.id as string);
+    assets++;
+  }
+
+  return { artifacts, assets };
 }
 
 /** Projects that still have pipeline work to do, for restart recovery. */

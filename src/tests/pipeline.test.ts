@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { startFakeOpenAI, state as fakeState, type FakeOpenAI } from './fake-openai.js';
+import { countOccurrences } from '../domain/terms.js';
 
 /**
  * Drives the whole pipeline against a stubbed model API: 22 agents, the
@@ -406,4 +407,45 @@ test('an automatic retry waits out a backoff before it can be claimed', async ()
 
   // Without the wait, three attempts would burn in about a second.
   assert.equal(repo.claimNextJob(project.id), null, 'it is not claimable yet');
+});
+
+test('a spelling decision is repaired across artifacts and locked assets', async () => {
+  const user = repo.upsertUser('terms@example.com');
+  const project = repo.createProject({
+    userId: user.id, title: 'Terms', idea: 'A ship with a contested name.',
+  });
+
+  // Work written before the answer carries the wrong spelling.
+  repo.writeArtifact({
+    projectId: project.id, kind: 'knowledge_map', producedByJobId: null,
+    data: {
+      entities: [{ name: 'Manado', kind: 'vehicle', description: 'The Manado sails.', aliases: ['Manado'] }],
+      relationships: [], timeline: [], locations: [],
+    },
+  });
+  const asset = repo.upsertVisualAsset({
+    projectId: project.id, name: 'Manado (Longship)', type: 'vehicle',
+    importance: 'primary', canonicalDescription: { hull: 'The Manado is clinker-built' },
+  });
+  // Locking is exactly the state that made this uncorrectable before.
+  repo.setAssetStatus(asset.id, 'locked');
+
+  const { artifacts, assets } = repo.applyTermCorrections(project.id, [
+    { wrong: 'Manado', right: 'Mapado' },
+  ]);
+
+  assert.equal(artifacts, 1, 'the artifact was rewritten');
+  assert.equal(assets, 1, 'the locked asset was renamed');
+
+  const map = repo.latestArtifact(project.id, 'knowledge_map')!;
+  assert.equal(countOccurrences(map.data, 'Manado'), 0, 'no wrong spelling survives');
+  assert.equal(countOccurrences(map.data, 'Mapado'), 3);
+
+  const renamed = repo.listVisualAssets(project.id).find((a) => a.id === asset.id)!;
+  assert.equal(renamed.name, 'Mapado (Longship)');
+  assert.equal(renamed.version, 2, 'renaming makes a new version, per VISUAL_CANON.md');
+  assert.equal(
+    countOccurrences(renamed.canonicalDescription, 'Manado'), 0,
+    'the canonical description is corrected too',
+  );
 });

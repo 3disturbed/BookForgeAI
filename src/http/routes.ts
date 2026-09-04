@@ -15,6 +15,7 @@ import { blobExists, blobExistsSync, signedUrlFor } from '../storage/blobs.js';
 import * as repo from '../store/repo.js';
 import { issueSession, clearSession, currentUserId, ownedProject, requireUser, userIdOf } from './auth.js';
 import { validateAnswers } from './decisions.js';
+import { deriveCorrections } from '../domain/terms.js';
 
 export const api = Router();
 
@@ -138,6 +139,47 @@ api.post('/projects/:id/retry', (req: Request, res: Response) => {
   res.json({ requeued, ...snapshot(req, project.id) });
 });
 
+/**
+ * Applies the project's spelling decisions to work already written.
+ *
+ * Answering a naming question does not travel backwards on its own: artifacts
+ * produced before the answer keep the wrong spelling, and downstream agents
+ * read those as canon. Visual assets are corrected too, including locked ones,
+ * since a locked asset with the wrong name cannot be fixed any other way.
+ */
+api.post('/projects/:id/repair-terms', (req: Request, res: Response) => {
+  const project = ownedProject(req, param(req, 'id'));
+
+  const decisions = repo.latestArtifact<{
+    answers: { question: string; answer: string; delegated: boolean }[];
+  }>(project.id, 'decisions');
+
+  const corrections = (decisions?.data.answers ?? [])
+    .filter((a) => !a.delegated && a.answer.trim())
+    .flatMap((a) => deriveCorrections(a.question, a.answer));
+
+  if (corrections.length === 0) {
+    res.json({ corrections: [], artifactsRewritten: 0, assetsRenamed: 0 });
+    return;
+  }
+
+  const { artifacts, assets } = repo.applyTermCorrections(project.id, corrections);
+
+  repo.recordEvent({
+    projectId: project.id,
+    type: 'VISUAL_ASSET_APPROVED',
+    actor: userIdOf(req),
+    payload: { repairedTerms: corrections, artifacts, assets },
+  });
+
+  res.json({
+    corrections,
+    artifactsRewritten: artifacts,
+    assetsRenamed: assets,
+    ...snapshot(req, project.id),
+  });
+});
+
 /* ---------------------------- approvals ---------------------------- */
 
 api.post('/projects/:id/approvals', (req: Request, res: Response) => {
@@ -252,9 +294,15 @@ function openQuestionsFor(projectId: string) {
     };
   });
 
+  const corrections = questions
+    .filter((q) => q.answered && !q.delegated)
+    .flatMap((q) => deriveCorrections(q.question, q.answer));
+
   return {
     questions,
     unanswered: questions.filter((q) => !q.answered).length,
+    /** Spellings enforced on every artifact as a result of these answers. */
+    corrections,
   };
 }
 
