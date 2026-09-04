@@ -1,7 +1,9 @@
 import OpenAI, { toFile } from 'openai';
 import { z } from 'zod';
-import { env, isOpenAiConfigured, resolveModel, type ModelCapability } from '../domain/env.js';
-import { BookForgeError } from '../domain/errors.js';
+import {
+  env, isOpenAiConfigured, resolveEffort, resolveModel, type ModelCapability,
+} from '../domain/env.js';
+import { BookForgeError, ContentRefusedError } from '../domain/errors.js';
 
 let client: OpenAI | null = null;
 
@@ -79,6 +81,7 @@ export async function generateStructured<T>(input: {
   images?: Buffer[];
 }): Promise<StructuredResult<T>> {
   const model = resolveModel(input.capability);
+  const effort = resolveEffort(input.capability);
   const maxAttempts = (input.maxRepairAttempts ?? 1) + 1;
 
   const usage: TokenUsage = { textInputTokens: 0, textOutputTokens: 0 };
@@ -111,11 +114,20 @@ export async function generateStructured<T>(input: {
   let lastIssues = '';
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const response = await openai().chat.completions.create({
+    let response;
+    try {
+      response = await openai().chat.completions.create({
       model,
       messages,
       response_format: { type: 'json_object' },
-    });
+      // Sent best-effort: models that do not reason simply ignore it.
+      ...(effort ? { reasoning_effort: effort } : {}),
+      });
+    } catch (error) {
+      const refusal = asRefusal(error);
+      if (refusal) throw refusal;
+      throw error;
+    }
 
     usage.textInputTokens += response.usage?.prompt_tokens ?? 0;
     usage.textOutputTokens += response.usage?.completion_tokens ?? 0;
@@ -155,6 +167,19 @@ export async function generateStructured<T>(input: {
   );
 }
 
+/**
+ * A safety refusal arrives as a 400 and is permanent for that prompt. Telling it
+ * apart from a transient 400 keeps the retry budget from being burned on it.
+ */
+export function asRefusal(error: unknown): ContentRefusedError | null {
+  const err = error as { status?: number; message?: string; error?: { message?: string } };
+  const message = err?.error?.message ?? err?.message ?? '';
+  if (err?.status === 400 && /safety|content[_ ]policy|moderation|safety_violations/i.test(message)) {
+    return new ContentRefusedError(message.slice(0, 300));
+  }
+  return null;
+}
+
 /* ---------------------------- images ----------------------------- */
 
 export interface ImageResult {
@@ -189,9 +214,16 @@ export async function generateImage(input: {
   const dims = SIZE_BY_RATIO[input.aspectRatio] ?? SIZE_BY_RATIO['2:3']!;
   const references = input.references ?? [];
 
-  const b64 = references.length
-    ? await editWithReferences(model, input.prompt, dims.size, references)
-    : await generateFresh(model, input.prompt, dims.size);
+  let b64: string;
+  try {
+    b64 = references.length
+      ? await editWithReferences(model, input.prompt, dims.size, references)
+      : await generateFresh(model, input.prompt, dims.size);
+  } catch (error) {
+    const refusal = asRefusal(error);
+    if (refusal) throw refusal;
+    throw error;
+  }
 
   return {
     png: Buffer.from(b64, 'base64'),
@@ -207,7 +239,9 @@ async function generateFresh(
   prompt: string,
   size: '1024x1024' | '1024x1536' | '1536x1024',
 ): Promise<string> {
-  const response = await openai().images.generate({ model, prompt, size, n: 1 });
+  const response = await openai().images.generate({
+    model, prompt, size, n: 1, quality: env().OPENAI_IMAGE_QUALITY,
+  });
   const b64 = response.data?.[0]?.b64_json;
   if (!b64) throw new BookForgeError('IMAGE_EMPTY', 'Image model returned no image data', 502);
   return b64;
@@ -224,7 +258,9 @@ async function editWithReferences(
   );
 
   try {
-    const response = await openai().images.edit({ model, image: files, prompt, size, n: 1 });
+    const response = await openai().images.edit({
+      model, image: files, prompt, size, n: 1, quality: env().OPENAI_IMAGE_QUALITY,
+    });
     const b64 = response.data?.[0]?.b64_json;
     if (!b64) throw new BookForgeError('IMAGE_EMPTY', 'Image model returned no image data', 502);
     return b64;

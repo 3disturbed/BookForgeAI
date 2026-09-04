@@ -36,7 +36,25 @@ export interface AgentDefinition {
    * separate job so one failing critic cannot silently shrink the critique set.
    */
   personas?: readonly string[];
+  /**
+   * Best-effort agents produce enrichment, not the book itself. A failure here
+   * — most often a model safety refusal on an image — costs the project one
+   * illustration, so the stage carries on rather than stalling forever.
+   */
+  optional?: boolean;
 }
+
+/**
+ * Per-persona input trimming. Each critic reads only what its lens needs, which
+ * removes a large amount of duplicated context from the five calls per chapter.
+ */
+export const CRITIC_INPUTS: Record<string, readonly ArtifactKind[]> = {
+  literary: ['chapter', 'design_spec'],
+  structural: ['chapter', 'outline', 'design_spec'],
+  audience: ['chapter', 'brief', 'design_spec'],
+  factual: ['chapter', 'research_library'],
+  continuity: ['chapter', 'knowledge_map', 'outline'],
+};
 
 export const CRITIC_PERSONAS = [
   'literary', 'structural', 'audience', 'factual', 'continuity',
@@ -61,9 +79,10 @@ export const AGENTS: Record<AgentName, AgentDefinition> = {
     reads: ['brief', 'knowledge_map'], writes: 'asset_registry', promptId: 'visual-canon',
   },
   'asset-designer': {
-    name: 'asset-designer', label: 'Asset Designer', capability: 'text', cardinality: 'asset',
+    name: 'asset-designer', label: 'Asset Designer', capability: 'light', cardinality: 'asset',
     reads: ['asset_registry', 'brief'], writes: 'reference_package',
     promptId: 'asset-designer',
+    optional: true,
   },
   architect: {
     name: 'architect', label: 'Architect', capability: 'reasoning', cardinality: 'single',
@@ -84,12 +103,12 @@ export const AGENTS: Record<AgentName, AgentDefinition> = {
     writes: 'chapter', promptId: 'author',
   },
   'scene-composer': {
-    name: 'scene-composer', label: 'Scene Composer', capability: 'text', cardinality: 'chapter',
+    name: 'scene-composer', label: 'Scene Composer', capability: 'light', cardinality: 'chapter',
     reads: ['chapter', 'asset_registry', 'design_spec'], writes: 'scene_spec',
     promptId: 'scene-composer',
   },
   'image-director': {
-    name: 'image-director', label: 'Image Director', capability: 'text', cardinality: 'scene',
+    name: 'image-director', label: 'Image Director', capability: 'light', cardinality: 'scene',
     reads: ['scene_spec', 'reference_package', 'design_spec'], writes: 'image_spec',
     promptId: 'image-director',
   },
@@ -97,11 +116,13 @@ export const AGENTS: Record<AgentName, AgentDefinition> = {
     name: 'image-generator', label: 'Image Generator', capability: 'image', cardinality: 'scene',
     reads: ['image_spec', 'reference_package'], writes: 'artwork',
     promptId: 'image-generator',
+    optional: true,
   },
   'visual-qa': {
     name: 'visual-qa', label: 'Visual QA', capability: 'reasoning', cardinality: 'scene',
     reads: ['artwork', 'image_spec', 'reference_package', 'asset_registry'],
     writes: 'visual_qa_result', promptId: 'visual-qa',
+    optional: true,
   },
   critics: {
     name: 'critics', label: 'Critics', capability: 'reasoning', cardinality: 'chapter',
@@ -123,7 +144,7 @@ export const AGENTS: Record<AgentName, AgentDefinition> = {
     reads: ['chapter', 'design_spec'], writes: 'edited_manuscript', promptId: 'editor',
   },
   'copy-editor': {
-    name: 'copy-editor', label: 'Copy Editor', capability: 'text', cardinality: 'chapter',
+    name: 'copy-editor', label: 'Copy Editor', capability: 'light', cardinality: 'chapter',
     reads: ['edited_manuscript', 'design_spec'], writes: 'clean_manuscript',
     promptId: 'copy-editor',
   },
@@ -142,7 +163,7 @@ export const AGENTS: Record<AgentName, AgentDefinition> = {
     reads: ['page_model'], writes: 'pdf_proof_report', promptId: 'proof',
   },
   publisher: {
-    name: 'publisher', label: 'Publisher', capability: 'text', cardinality: 'single',
+    name: 'publisher', label: 'Publisher', capability: 'light', cardinality: 'single',
     reads: ['page_model', 'pdf_proof_report', 'clean_manuscript'], writes: 'edition',
     promptId: 'publisher',
   },

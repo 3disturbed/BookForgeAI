@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { evaluateAcceptance } from '../domain/acceptance.js';
-import { AGENTS } from '../domain/agents.js';
+import { AGENTS, type AgentName } from '../domain/agents.js';
 import { computeMargin, DEFAULT_RATES } from '../domain/costs.js';
 import { env, isOpenAiConfigured, isStripeConfigured } from '../domain/env.js';
 import { BadRequestError, BookForgeError, NotFoundError, PreconditionError } from '../domain/errors.js';
@@ -333,20 +333,32 @@ function snapshot(req: Request, projectId: string) {
     const stageJobs = jobs.filter((j) => j.stage === stage.id);
     const done = completed.has(stage.id);
     const active = stageJobs.some((j) => j.status === 'queued' || j.status === 'running');
-    const failed = stageJobs.some((j) => j.status === 'failed' || j.status === 'blocked');
     const gate = stage.gate ?? null;
     const awaitingApproval = done && Boolean(gate) && approvals[gate!] !== true;
+
+    // A best-effort job failing costs the book an illustration, not the stage.
+    // Reporting that as "failed" would misdescribe a pipeline that is fine.
+    const broken = stageJobs.filter(
+      (j) => (j.status === 'failed' || j.status === 'blocked') &&
+        !AGENTS[j.agent as AgentName]?.optional,
+    );
+    const degraded = stageJobs.filter(
+      (j) => j.status === 'failed' && AGENTS[j.agent as AgentName]?.optional,
+    );
 
     return {
       id: stage.id,
       step: stage.step,
       label: stage.label,
       gate,
-      state: failed ? 'failed' : awaitingApproval ? 'awaiting_approval'
-        : done ? 'complete' : active ? 'running' : 'pending',
+      state: broken.length ? 'failed'
+        : awaitingApproval ? 'awaiting_approval'
+        : done ? (degraded.length ? 'degraded' : 'complete')
+        : active ? 'running' : 'pending',
       jobs: stageJobs.length,
       done: stageJobs.filter((j) => j.status === 'completed').length,
-      errors: stageJobs.filter((j) => j.status === 'failed').map((j) => j.error).slice(0, 3),
+      degraded: degraded.length,
+      errors: [...broken, ...degraded].map((j) => j.error).slice(0, 3),
     };
   });
 

@@ -43,7 +43,7 @@ test('all 22 agents are registered and every artifact kind has a schema', () => 
 
 test('no agent hard-codes a model', () => {
   for (const agent of Object.values(AGENTS)) {
-    assert.ok(['text', 'reasoning', 'image'].includes(agent.capability));
+    assert.ok(['text', 'reasoning', 'light', 'image'].includes(agent.capability));
   }
 });
 

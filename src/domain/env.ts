@@ -30,8 +30,23 @@ const EnvSchema = z.object({
   OPENAI_API_KEY: z.string().default(''),
   OPENAI_BASE_URL: z.string().default(''),
   OPENAI_TEXT_MODEL: z.string().default('gpt-5'),
+  /** Falls back to OPENAI_TEXT_MODEL when blank. */
   OPENAI_REASONING_MODEL: z.string().default(''),
+  /**
+   * Mechanical agents — restating a spec, applying style rules, filling a
+   * template — do not need the frontier model. Routing them here is the single
+   * largest cost lever in the pipeline.
+   */
+  OPENAI_LIGHT_MODEL: z.string().default('gpt-5-mini'),
   OPENAI_IMAGE_MODEL: z.string().default('gpt-image-2'),
+
+  /** Reasoning effort per tier. Lower effort means fewer billed thinking tokens. */
+  OPENAI_REASONING_EFFORT: z.enum(['minimal', 'low', 'medium', 'high']).default('medium'),
+  OPENAI_TEXT_EFFORT: z.enum(['minimal', 'low', 'medium', 'high']).default('low'),
+  OPENAI_LIGHT_EFFORT: z.enum(['minimal', 'low', 'medium', 'high']).default('minimal'),
+
+  /** Image fidelity. `low` is the draft setting and costs a fraction of `high`. */
+  OPENAI_IMAGE_QUALITY: z.enum(['low', 'medium', 'high', 'auto']).default('medium'),
 
   STRIPE_SECRET_KEY: z.string().default(''),
   STRIPE_WEBHOOK_SECRET: z.string().default(''),
@@ -72,6 +87,7 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): Env {
   // A variable present but blank in .env should fall back to the default rather
   // than override it with an empty string.
   if (!value.OPENAI_TEXT_MODEL) value.OPENAI_TEXT_MODEL = 'gpt-5';
+  if (!value.OPENAI_LIGHT_MODEL) value.OPENAI_LIGHT_MODEL = 'gpt-5-mini';
   if (!value.OPENAI_IMAGE_MODEL) value.OPENAI_IMAGE_MODEL = 'gpt-image-2';
   return value;
 }
@@ -99,12 +115,13 @@ export function isOpenAiConfigured(config: Env = env()): boolean {
  * Model routing. AGENTS.md: "Do not hard-code a model name into business logic."
  * Agents declare a capability; the concrete model comes from config.
  */
-export type ModelCapability = 'text' | 'reasoning' | 'image';
+export type ModelCapability = 'text' | 'reasoning' | 'light' | 'image';
 
 export function resolveModel(capability: ModelCapability, config: Env = env()): string {
   const model = {
     text: config.OPENAI_TEXT_MODEL,
     reasoning: config.OPENAI_REASONING_MODEL || config.OPENAI_TEXT_MODEL,
+    light: config.OPENAI_LIGHT_MODEL,
     image: config.OPENAI_IMAGE_MODEL,
   }[capability];
 
@@ -115,4 +132,19 @@ export function resolveModel(capability: ModelCapability, config: Env = env()): 
     );
   }
   return model;
+}
+
+export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high';
+
+/** Thinking budget for a tier. Not every model honours it; it is sent best-effort. */
+export function resolveEffort(
+  capability: ModelCapability,
+  config: Env = env(),
+): ReasoningEffort | null {
+  switch (capability) {
+    case 'reasoning': return config.OPENAI_REASONING_EFFORT;
+    case 'text': return config.OPENAI_TEXT_EFFORT;
+    case 'light': return config.OPENAI_LIGHT_EFFORT;
+    default: return null;
+  }
 }

@@ -238,7 +238,7 @@ const tabForResource = (r) =>
 
 function renderPipeline() {
   const { stages, jobCounts, project } = state.current;
-  const done = stages.filter((s) => s.state === 'complete').length;
+  const done = stages.filter((s) => s.state === 'complete' || s.state === 'degraded').length;
 
   return el('div', {},
     !state.config.openaiConfigured &&
@@ -278,7 +278,10 @@ function renderStage(stage) {
       el('b', {}, stage.label),
       stage.jobs > 0 && el('span', { class: 'muted', style: 'font-size:11px' },
         `${stage.done}/${stage.jobs}`),
-      stage.errors.length > 0 &&
+      stage.state === 'degraded' &&
+        el('span', { class: 'tag warn', title: stage.errors.join('\n') },
+          `${stage.degraded} skipped`),
+      stage.state === 'failed' && stage.errors.length > 0 &&
         el('span', { class: 'tag err', title: stage.errors.join('\n') }, 'error'),
     ),
     el('div', { class: 'row' },

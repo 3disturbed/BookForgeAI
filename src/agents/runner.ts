@@ -1,8 +1,8 @@
 import { z } from 'zod';
-import { agentDefinition, type AgentName } from '../domain/agents.js';
+import { agentDefinition, CRITIC_INPUTS, type AgentName } from '../domain/agents.js';
 import type { ArtifactKind } from '../domain/artifacts.js';
 import { env } from '../domain/env.js';
-import { BookForgeError } from '../domain/errors.js';
+import { BookForgeError, ContentRefusedError } from '../domain/errors.js';
 import { slug } from '../domain/ids.js';
 import { schemaFor } from '../domain/schemas.js';
 import { storageKey } from '../domain/storage-paths.js';
@@ -10,6 +10,7 @@ import type { UsageRecord } from '../domain/costs.js';
 import { asUntrustedData, generateImage, generateStructured } from '../ai/openai.js';
 import { loadPrompt, renderPrompt } from '../ai/prompts.js';
 import { getBlob, putBlob } from '../storage/blobs.js';
+import { renderPdf, type PageModel } from '../pdf/render.js';
 import * as repo from '../store/repo.js';
 
 /** Result of one agent execution, before it is committed. */
@@ -235,17 +236,25 @@ export async function executeAgent(
       // sheet is the anchor every later illustration of this asset is matched to.
       const pkg = outcome.data as { referencePrompts: string[]; negativePrompts: string[] };
       if (env().ENABLE_ILLUSTRATIONS && pkg.referencePrompts?.length) {
-        const image = await generateImage({
-          prompt: [pkg.referencePrompts[0], negativeClause(pkg.negativePrompts)]
-            .filter(Boolean)
-            .join(' '),
-          aspectRatio: '1:1',
-        });
-        const key = storageKey(project.id, 'assets', `${slug(asset.name)}-reference.png`);
-        await putBlob(key, image.png);
-        repo.addAssetReferenceImage(asset.id, key);
-        repo.setAssetStatus(asset.id, 'review');
-        outcome.usage.imageGenerations = (outcome.usage.imageGenerations ?? 0) + 1;
+        try {
+          const image = await generateImage({
+            prompt: [pkg.referencePrompts[0], negativeClause(pkg.negativePrompts)]
+              .filter(Boolean)
+              .join(' '),
+            aspectRatio: '1:1',
+          });
+          const key = storageKey(project.id, 'assets', `${slug(asset.name)}-reference.png`);
+          await putBlob(key, image.png);
+          repo.addAssetReferenceImage(asset.id, key);
+          repo.setAssetStatus(asset.id, 'review');
+          outcome.usage.imageGenerations = (outcome.usage.imageGenerations ?? 0) + 1;
+        } catch (error) {
+          // The written bible is the artifact that matters; the reference sheet
+          // is enrichment. Innocuous subjects do get refused — a carving knife
+          // reads as a weapon — so losing the image must not lose the asset.
+          if (!(error instanceof ContentRefusedError)) throw error;
+          repo.setAssetStatus(asset.id, 'review');
+        }
       }
       return outcome;
     }
@@ -271,19 +280,23 @@ export async function executeAgent(
 
     case 'critics': {
       const scope = job.scopeKey ?? '';
+      const persona = job.persona ?? 'literary';
+      // Each lens reads only the artifacts it can actually act on, which keeps
+      // five critics per chapter from re-sending the same context five times.
+      const wanted = CRITIC_INPUTS[persona] ?? ['chapter', 'design_spec'];
+      const context = wanted.map((kind) =>
+        kind === 'chapter'
+          ? asUntrustedData('chapter', currentChapter(project.id, scope) ?? {})
+          : asUntrustedData(kind, readSingle(project.id, kind) ?? {}),
+      );
+
       return {
         ...(await reason(
-          [
-            asUntrustedData('chapter', currentChapter(project.id, scope) ?? {}),
-            asUntrustedData('outline', requireSingle(project.id, 'outline')),
-            asUntrustedData('design_spec', requireSingle(project.id, 'design_spec')),
-            asUntrustedData('knowledge_map', requireSingle(project.id, 'knowledge_map')),
-            asUntrustedData('research_library', readSingle(project.id, 'research_library') ?? {}),
-          ],
-          { system: renderPrompt(prompt.body, { persona: job.persona ?? 'literary' }) },
+          context,
+          { system: renderPrompt(prompt.body, { persona }) },
         )),
         // One artifact per persona, so five critics leave five critiques.
-        artifactScopeKey: `${scope}#${job.persona ?? 'literary'}`,
+        artifactScopeKey: `${scope}#${persona}`,
       };
     }
 
@@ -466,17 +479,35 @@ export async function executeAgent(
     }
 
     case 'proof': {
-      const pageModel = requireSingle<{ pages: unknown[] }>(project.id, 'page_model');
-      const render = repo.latestArtifact<{ pageCount: number; missingImages: string[] }>(
-        project.id,
-        'pdf_proof_report',
-      );
+      const pageModel = requireSingle<PageModel>(project.id, 'page_model');
+
+      // PDF_PIPELINE.md proofs the rendered document, so the render happens
+      // here rather than as a fire-and-forget side effect: it is awaited, it
+      // retries with the job, and a failure surfaces as a failed job.
+      const render = await renderPdf(pageModel);
+      const key = storageKey(project.id, 'renders', 'edition-draft.pdf');
+      await putBlob(key, render.pdf);
+
+      repo.recordEvent({
+        projectId: project.id,
+        type: 'PDF_RENDERED',
+        actor: 'system',
+        payload: {
+          pageCount: render.pageCount,
+          engine: render.engine,
+          missingImages: render.missingImages,
+          storageKey: key,
+        },
+      });
+
       return reason([
-        asUntrustedData('page_model_summary', {
-          pageCount: pageModel.pages?.length ?? 0,
-          pages: pageModel.pages,
+        asUntrustedData('rendered_pdf', {
+          pageCount: render.pageCount,
+          engine: render.engine,
+          missingImages: render.missingImages,
         }),
-        asUntrustedData('previous_render', render?.data ?? {}),
+        asUntrustedData('planned_pages', pageModel.pages?.length ?? 0),
+        asUntrustedData('page_model', pageModel.pages),
       ]);
     }
 
@@ -555,9 +586,11 @@ export async function runJob(job: repo.JobRow): Promise<void> {
  */
 function isRetryable(error: unknown): boolean {
   if (error instanceof BookForgeError) {
-    return !['MISSING_INPUT', 'OPENAI_NOT_CONFIGURED', 'PROMPT_MISSING', 'UNKNOWN_AGENT'].includes(
-      error.code,
-    );
+    return ![
+      'MISSING_INPUT', 'OPENAI_NOT_CONFIGURED', 'PROMPT_MISSING', 'UNKNOWN_AGENT',
+      // Retrying an identical prompt earns an identical refusal.
+      'CONTENT_REFUSED',
+    ].includes(error.code);
   }
   return true;
 }

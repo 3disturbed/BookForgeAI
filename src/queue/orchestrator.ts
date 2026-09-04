@@ -64,8 +64,16 @@ function planJobs(project: repo.ProjectRow, agent: AgentName): PlannedJob[] {
         .filter((a) => a.status !== 'retired')
         .map((a) => ({ scopeKey: slug(a.name) }));
 
-    case 'scene':
-      return allScenes(project.id).map((s) => ({ scopeKey: s.key }));
+    case 'scene': {
+      const scenes = allScenes(project.id).map((s) => ({ scopeKey: s.key }));
+      // QA can only judge a render that exists; a refused image has none.
+      if (agent !== 'visual-qa') return scenes;
+      const rendered = new Set(
+        repo.latestArtifactsOfKind<{ sceneKey: string }>(project.id, 'artwork')
+          .map((a) => a.data.sceneKey),
+      );
+      return scenes.filter((s) => s.scopeKey && rendered.has(s.scopeKey));
+    }
   }
 }
 
@@ -111,7 +119,11 @@ export function advanceProject(projectId: string): void {
     const round = roundFor(project, stage.id);
     if (repo.activeJobsForStage(project.id, stage.id, round).length > 0) return;
 
-    const failures = repo.failedJobsForStage(project.id, stage.id, round);
+    // A failed best-effort job costs the book an illustration, not the run.
+    const failures = repo
+      .failedJobsForStage(project.id, stage.id, round)
+      .filter((job) => !agentDefinition(job.agent as AgentName).optional);
+
     if (failures.length > 0) {
       setStatus(project.id, 'review');
       return;
@@ -143,7 +155,11 @@ export function advanceProject(projectId: string): void {
 
       // No work for this agent at all (e.g. nothing to rewrite): move on.
       if (existing.length === 0) continue;
-      if (existing.some((j) => j.status !== 'completed')) return;
+
+      const settled = agentDefinition(agent).optional
+        ? (j: repo.JobRow) => j.status === 'completed' || j.status === 'failed' || j.status === 'blocked'
+        : (j: repo.JobRow) => j.status === 'completed';
+      if (!existing.every(settled)) return;
     }
 
     if (enqueued) {
@@ -265,10 +281,8 @@ function runStageHooks(project: repo.ProjectRow, stage: StageDefinition): void {
     case 'illustrate':
       repo.recordEvent({ projectId: project.id, type: 'ILLUSTRATION_GENERATED', actor: 'system' });
       break;
-    case 'layout':
-      // The PDF is rendered before Proof so Proof QAs a real document.
-      void renderProjectPdf(project.id);
-      break;
+    // Rendering belongs to the Proof job, which awaits it and QAs the result.
+
     case 'proof':
       repo.recordEvent({ projectId: project.id, type: 'PDF_PROOFED', actor: 'system' });
       markReadyForPublish(project.id);
@@ -384,19 +398,27 @@ function enqueueRegenerations(project: repo.ProjectRow): boolean {
 
 /* ------------------------------- PDF -------------------------------- */
 
-export async function renderProjectPdf(projectId: string): Promise<string | null> {
+/** Re-renders on demand, e.g. to produce the final export of an edition. */
+export async function renderProjectPdf(
+  projectId: string,
+  prefix: 'renders' | 'exports' = 'renders',
+  filename = 'edition-draft.pdf',
+): Promise<string | null> {
   const pageModel = repo.latestArtifact<PageModel>(projectId, 'page_model');
   if (!pageModel) return null;
 
   const result = await renderPdf(pageModel.data);
-  const key = storageKey(projectId, 'renders', `edition-draft.pdf`);
+  const key = storageKey(projectId, prefix, filename);
   await putBlob(key, result.pdf);
 
   repo.recordEvent({
     projectId,
     type: 'PDF_RENDERED',
     actor: 'system',
-    payload: { pageCount: result.pageCount, missingImages: result.missingImages, storageKey: key },
+    payload: {
+      pageCount: result.pageCount, engine: result.engine,
+      missingImages: result.missingImages, storageKey: key,
+    },
   });
   return key;
 }

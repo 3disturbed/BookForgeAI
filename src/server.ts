@@ -138,6 +138,11 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
 /* ------------------------------ start ------------------------------- */
 
 database();
+
+// Anything left `running` by a previous process has no worker behind it.
+const requeued = repo.requeueStaleJobs();
+if (requeued > 0) console.log(`Requeued ${requeued} job(s) interrupted by a restart.`);
+
 startWorker();
 
 // Projects interrupted by a restart pick up where they left off.

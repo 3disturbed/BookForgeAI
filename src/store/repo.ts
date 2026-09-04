@@ -782,6 +782,33 @@ export function totalUsage(projectId: string): UsageRecord {
   };
 }
 
+/**
+ * Requeues jobs left mid-flight by a crash or restart. A job marked `running`
+ * has no worker behind it once the process is gone, so it would block its stage
+ * forever. Jobs that have already exhausted their retries are failed instead.
+ */
+export function requeueStaleJobs(maxRetries = 2): number {
+  const db = database();
+  const stale = db
+    .prepare(`SELECT id, retry_count FROM agent_jobs WHERE status = 'running'`)
+    .all() as Record<string, unknown>[];
+
+  for (const row of stale) {
+    const id = row.id as string;
+    if (Number(row.retry_count ?? 0) >= maxRetries) {
+      db.prepare(
+        `UPDATE agent_jobs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?`,
+      ).run('Interrupted by restart, retries exhausted', nowIso(), id);
+    } else {
+      db.prepare(
+        `UPDATE agent_jobs SET status = 'queued', retry_count = retry_count + 1,
+         error = 'Requeued after restart', started_at = NULL WHERE id = ?`,
+      ).run(id);
+    }
+  }
+  return stale.length;
+}
+
 /** Projects that still have pipeline work to do, for restart recovery. */
 export function allActiveProjectIds(): string[] {
   const rows = database()

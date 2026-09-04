@@ -51,6 +51,16 @@ export class NotAuthorizedError extends BookForgeError {
   }
 }
 
+/**
+ * The model's safety system refused the request. Retrying an identical prompt
+ * produces an identical refusal, so this must never be retried.
+ */
+export class ContentRefusedError extends BookForgeError {
+  constructor(detail: string) {
+    super('CONTENT_REFUSED', `Model refused the request: ${detail}`, 422, { detail });
+  }
+}
+
 export class NotFoundError extends BookForgeError {
   constructor(resource: string) {
     super('NOT_FOUND', `${resource} not found`, 404, { resource });
